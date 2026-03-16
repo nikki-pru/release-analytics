@@ -269,7 +269,7 @@ pred_results <- fd %>%
     model_mae     = round(mean(abs(vd$LPD - lpd_vp)), 2),
     validated_on  = valid_q
   ) %>%
-  select(quarter, component,
+  dplyr::select(quarter, component,
          lpd_pred, lpd_pct, lpd_risk_level,
          risk_score, overall_risk,
          model_name, model_r2, model_cal, model_mae, validated_on)
@@ -483,7 +483,7 @@ team_scorecard <- forecast_by_component %>%
   left_join(
     test_health_by_team %>%
       filter(case_type == "Automated Functional Test") %>%
-      select(team, acceptance_cases = n_test_cases,
+      dplyr::select(team, acceptance_cases = n_test_cases,
              acceptance_failures    = total_failures,
              acceptance_catch_rate  = avg_bug_catch_rate,
              acceptance_signal      = avg_signal_score,
@@ -494,7 +494,7 @@ team_scorecard <- forecast_by_component %>%
   left_join(
     test_health_by_team %>%
       filter(case_type == "Modules Integration Test") %>%
-      select(team, release_cases    = n_test_cases,
+      dplyr::select(team, release_cases    = n_test_cases,
              release_failures       = total_failures,
              release_catch_rate     = avg_bug_catch_rate,
              release_signal         = avg_signal_score,
@@ -665,7 +665,7 @@ if (!file.exists(jira_path)) {
 
   word_freq <- jira %>%
     filter(!is.na(summary), summary != "") %>%
-    select(project, quarter, summary) %>%
+    dplyr::select(project, quarter, summary) %>%
     unnest_tokens(word, summary) %>%
     filter(!word %in% custom_stops, nchar(word) > 2) %>%
     count(project, word) %>%
@@ -674,9 +674,9 @@ if (!file.exists(jira_path)) {
     ungroup()
 
   lpp_words <- word_freq %>% filter(project == "LPP") %>%
-    select(word, lpp_n = n, lpp_prop = proportion)
+    dplyr::select(word, lpp_n = n, lpp_prop = proportion)
   lpd_words <- word_freq %>% filter(project == "LPD") %>%
-    select(word, lpd_n = n, lpd_prop = proportion)
+    dplyr::select(word, lpd_n = n, lpd_prop = proportion)
 
   blind_spots <- lpp_words %>%
     full_join(lpd_words, by = "word") %>%
