@@ -279,7 +279,7 @@ bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh --branch your-bra
 By default, test execution and compilation are skipped for speed. Opt in explicitly:
 
 Flags:
-- `--run-test` — run `ant test-class` on affected modules
+- `--run-test` — run `ant test-class -Dtest.class=ModulesStructureTest`
 - `--run-compile` — run `gw clean deploy` on affected modules
 
 Output: a risk score (0–100) per affected module with signal breakdown.
