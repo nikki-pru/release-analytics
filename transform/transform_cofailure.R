@@ -165,10 +165,12 @@ test_quality <- failures |>
     .groups = "drop"
   ) |>
   mutate(
-    bug_catch_rate = round(bug_linked_builds / total_fail_builds, 4),
-    signal_score   = round(
-      (bug_catch_rate * 0.70) +
-        (pmin(bug_linked_builds / max(bug_linked_builds, 1), 1) * 0.30),
+    investigation_rate = round(bug_linked_builds / total_fail_builds, 4),
+    signal_score       = round(
+      (
+        (investigation_rate * 0.70) +
+          (pmin(bug_linked_builds / max(bug_linked_builds, 1), 1) * 0.30)
+      ) * (1 - sqrt(total_fail_builds) / sqrt(max(total_fail_builds, 1))),
       4
     )
   ) |>
