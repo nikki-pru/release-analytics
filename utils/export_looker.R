@@ -389,7 +389,7 @@ test_health_by_component <- dbGetQuery(con, "
     SUM(tq.total_fail_builds)             AS total_failures,
     SUM(tq.bug_linked_builds)             AS bug_linked_failures,
     SUM(tq.distinct_bugs_linked)          AS distinct_bugs_linked,
-    ROUND(AVG(tq.bug_catch_rate)::NUMERIC, 4) AS avg_bug_catch_rate,
+    ROUND(AVG(tq.investigation_rate)::NUMERIC, 4) AS avg_investigation_rate,
     ROUND(AVG(tq.signal_score)::NUMERIC, 4)   AS avg_signal_score,
     -- Failure rate: what proportion of builds fail
     CASE
@@ -423,14 +423,14 @@ test_health_by_team <- dbGetQuery(con, "
     SUM(tq.total_fail_builds)               AS total_failures,
     SUM(tq.bug_linked_builds)               AS bug_linked_failures,
     SUM(tq.distinct_bugs_linked)            AS distinct_bugs_linked,
-    ROUND(AVG(tq.bug_catch_rate)::NUMERIC, 4)   AS avg_bug_catch_rate,
+    ROUND(AVG(tq.investigation_rate)::NUMERIC, 4)   AS avg_investigation_rate,
     ROUND(AVG(tq.signal_score)::NUMERIC, 4)     AS avg_signal_score,
     -- High signal tests: signal_score > 0.1
     COUNT(CASE WHEN tq.signal_score > 0.1 THEN 1 END) AS high_signal_tests,
     -- Zero catch tests: never linked to a bug
-    COUNT(CASE WHEN tq.bug_catch_rate = 0 THEN 1 END) AS zero_catch_tests,
+    COUNT(CASE WHEN tq.investigation_rate = 0 THEN 1 END) AS zero_catch_tests,
     ROUND(
-      COUNT(CASE WHEN tq.bug_catch_rate = 0 THEN 1 END)::NUMERIC /
+      COUNT(CASE WHEN tq.investigation_rate = 0 THEN 1 END)::NUMERIC /
       NULLIF(COUNT(DISTINCT tq.case_id), 0) * 100, 1
     ) AS pct_zero_catch,
     MAX(tq.calculated_at) AS last_calculated
@@ -485,7 +485,7 @@ team_scorecard <- forecast_by_component %>%
       filter(case_type == "Automated Functional Test") %>%
       dplyr::select(team, acceptance_cases = n_test_cases,
              acceptance_failures    = total_failures,
-             acceptance_catch_rate  = avg_bug_catch_rate,
+             acceptance_catch_rate  = avg_investigation_rate,
              acceptance_signal      = avg_signal_score,
              acceptance_pct_zero    = pct_zero_catch),
     by = "team"
@@ -496,7 +496,7 @@ team_scorecard <- forecast_by_component %>%
       filter(case_type == "Modules Integration Test") %>%
       dplyr::select(team, release_cases    = n_test_cases,
              release_failures       = total_failures,
-             release_catch_rate     = avg_bug_catch_rate,
+             release_catch_rate     = avg_investigation_rate,
              release_signal         = avg_signal_score,
              release_pct_zero       = pct_zero_catch),
     by = "team"
