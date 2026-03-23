@@ -871,33 +871,37 @@ message("\n--- L04 complexity_by_component ---")
 
 complexity_by_component <- dbGetQuery(con, "
   SELECT
-    dc.component_name     AS component,
-    dc.team_name          AS team,
-    COUNT(DISTINCT df.file_id)                                        AS n_files,
-    ROUND(AVG(fc.cyclomatic_complexity)::NUMERIC, 1)                  AS avg_cyclomatic,
-    ROUND(AVG(fc.cognitive_complexity)::NUMERIC, 1)                   AS avg_cognitive,
-    -- Weight LOC and violations to avoid double-counting multi-mapped modules
-    ROUND(SUM(fc.lines_of_code          * mcm.weight)::NUMERIC, 0)   AS weighted_loc,
-    ROUND(SUM(fc.violation_count        * mcm.weight)::NUMERIC, 0)   AS weighted_violations,
-    ROUND(SUM(fc.violation_blocker_count  * mcm.weight)::NUMERIC, 0) AS weighted_blocker_violations,
-    ROUND(SUM(fc.violation_critical_count * mcm.weight)::NUMERIC, 0) AS weighted_critical_violations,
-    ROUND(SUM(fc.tech_debt_minutes      * mcm.weight) / 60.0, 1)     AS weighted_tech_debt_hours,
-    -- Complexity risk score: weighted combination of cyclomatic + violations + debt
+    dc.component_name                                                   AS component,
+    dc.team_name                                                        AS team,
+    COUNT(DISTINCT df.file_id)                                          AS n_files,
+    -- CCN and NLOC: AVG across files (not SUM — complexity doesn't accumulate)
+    ROUND(AVG(fc.avg_ccn)::NUMERIC,  1)                                AS avg_cyclomatic,
+    ROUND(AVG(fc.avg_nloc)::NUMERIC, 1)                                AS avg_cognitive,
+    -- Java / frontend split
+    ROUND(AVG(fc.avg_ccn_java)::NUMERIC,     1)                        AS avg_ccn_java,
+    ROUND(AVG(fc.avg_ccn_frontend)::NUMERIC, 1)                        AS avg_ccn_frontend,
+    -- Language mix (most common value per component)
+    MODE() WITHIN GROUP (ORDER BY fc.language_mix)                     AS language_mix,
+    -- LOC and violations: SUM * weight to avoid double-counting multi-mapped modules
+    ROUND(SUM(fc.lines_of_code            * mcm.weight)::NUMERIC, 0)  AS weighted_loc,
+    ROUND(SUM(fc.violation_count          * mcm.weight)::NUMERIC, 0)  AS weighted_violations,
+    ROUND(SUM(fc.violation_blocker_count  * mcm.weight)::NUMERIC, 0)  AS weighted_blocker_violations,
+    ROUND(SUM(fc.violation_critical_count * mcm.weight)::NUMERIC, 0)  AS weighted_critical_violations,
+    ROUND(SUM(fc.tech_debt_minutes        * mcm.weight) / 60.0, 1)    AS weighted_tech_debt_hours,
+    -- Complexity risk score: CCN percentile rank (violations/debt zeroed — SonarQube retired)
     ROUND((
-      0.4 * PERCENT_RANK() OVER (ORDER BY AVG(fc.cyclomatic_complexity)) +
-      0.3 * PERCENT_RANK() OVER (ORDER BY SUM(fc.violation_count * mcm.weight)) +
-      0.3 * PERCENT_RANK() OVER (ORDER BY SUM(fc.tech_debt_minutes * mcm.weight))
-    )::NUMERIC * 100, 1)                                              AS complexity_risk_pct,
-    MAX(fc.snapshot_date)                                             AS snapshot_date
+      PERCENT_RANK() OVER (ORDER BY AVG(fc.avg_ccn))
+    )::NUMERIC * 100, 1)                                               AS complexity_risk_pct,
+    MAX(fc.snapshot_date)                                              AS snapshot_date
   FROM fact_file_complexity fc
-  JOIN dim_file df ON df.file_id = fc.file_id
+  JOIN dim_file df   ON df.file_id      = fc.file_id
+  JOIN dim_module dm ON dm.module_id    = df.module_id
   JOIN dim_module_component_map mcm
-    ON mcm.module_path = REGEXP_REPLACE(
-         df.file_path, '^(modules/[^/]+/[^/]+).*', '\\1')
+                     ON mcm.module_path = dm.module_path_category
   JOIN dim_component dc ON dc.component_id = mcm.component_id
-  WHERE df.file_path LIKE 'modules/%'
+  WHERE dm.module_path_category IS NOT NULL
   GROUP BY dc.component_name, dc.team_name
-  ORDER BY weighted_tech_debt_hours DESC
+  ORDER BY avg_cyclomatic DESC
 ")
 
 write_export(complexity_by_component, dir_landscape, "L04_complexity_by_component.csv")

@@ -87,7 +87,7 @@ Weights are configured in `config/config.yml` under `scoring.weights` and can be
 
 | Signal | Weight | Granularity | Source |
 |---|---|---|---|
-| Complexity | 28% | File | SonarQube — blended cyclomatic (35%) + cognitive (40%) + violations (25%) |
+| Complexity | 28% | File | lizard — cyclomatic CCN (file-level average), NLOC as cognitive proxy. Java and frontend scored separately. |
 | Churn | 25% | File | Git — commit frequency + author turnover, multi-window decay |
 | Defect | 20% | Module → File | Jira LPD — bug count + severity-weighted score, multi-window decay |
 | Test | 15% | Module → File | Testray — failure rate (70%) + co-failure score (30%) |
@@ -179,7 +179,7 @@ source("transform/transform_churn.R")        # git churn → fact_file_churn
 source("transform/transform_defects.R")      # Jira LPD → fact_defect_history
 source("transform/transform_test_risk.R")    # Testray → fact_test_failure
 source("transform/transform_cofailure.R")    # Testray → fact_test_quality
-source("transform/transform_complexity.R")   # SonarQube → fact_file_complexity
+Rscript utils/load_lizard.R                  # lizard CSV → fact_file_complexity (replaces transform_complexity.R)
 source("transform/transform_dependencies.R") # OSGi graph → fact_file_dependencies
 source("transform/transform_scores.R")       # Assemble → fact_file_risk_score
 ```

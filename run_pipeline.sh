@@ -17,6 +17,7 @@
 # Steps (for --step):
 #   sync_releases
 #   load_map
+#   load_lizard
 #   ingest_churn
 #   extract_jira
 #   transform
@@ -45,6 +46,7 @@ RSCRIPT="Rscript --vanilla"
 # Flags
 # -----------------------------------------------------------------------------
 SKIP_JIRA=false
+SKIP_LIZARD=false
 SKIP_EXPORT=false
 RUN_LDA=false
 DRY_RUN=false
@@ -53,6 +55,7 @@ SINGLE_STEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-jira)    SKIP_JIRA=true;    shift ;;
+    --skip-lizard)  SKIP_LIZARD=true;  shift ;;
     --skip-export)  SKIP_EXPORT=true;  shift ;;
     --run-lda)      RUN_LDA=true;      shift ;;
     --dry-run)      DRY_RUN=true;      shift ;;
@@ -123,7 +126,8 @@ info "Liferay Release Analytics Platform — Pipeline Run"
 info "Project root: $PROJECT_ROOT"
 info "Log: $LOG_FILE"
 [[ "$DRY_RUN"    == true ]] && info "Mode: DRY RUN"
-[[ "$SKIP_JIRA"  == true ]] && info "Skipping Jira extraction"
+[[ "$SKIP_JIRA"   == true ]] && info "Skipping Jira extraction"
+[[ "$SKIP_LIZARD" == true ]] && info "Skipping lizard complexity load"
 [[ "$SKIP_EXPORT" == true ]] && info "Skipping Looker export"
 [[ "$RUN_LDA"    == true ]] && info "LDA topic analysis enabled"
 [[ -n "$SINGLE_STEP" ]]    && info "Single step mode: $SINGLE_STEP"
@@ -135,6 +139,14 @@ step_sync_releases() {
 
 step_load_map() {
   run_r "load_module_component_map" "utils/load_module_component_map.R"
+}
+
+step_load_lizard() {
+  if [[ "$SKIP_LIZARD" == true ]]; then
+    warn "Skipping lizard load (--skip-lizard)"
+    return 0
+  fi
+  run_r "load_lizard" "utils/load_lizard.R"
 }
 
 step_ingest_churn() {
@@ -181,6 +193,7 @@ if [[ -n "$SINGLE_STEP" ]]; then
   case "$SINGLE_STEP" in
     sync_releases)  step_sync_releases ;;
     load_map)       step_load_map ;;
+    load_lizard)    step_load_lizard ;;
     ingest_churn)   step_ingest_churn ;;
     extract_jira)   step_extract_jira ;;
     transform)      step_transform ;;
@@ -188,7 +201,7 @@ if [[ -n "$SINGLE_STEP" ]]; then
     lda)            RUN_LDA=true; step_lda ;;
     *)
       error "Unknown step: $SINGLE_STEP"
-      error "Valid steps: sync_releases, load_map, ingest_churn, extract_jira, transform, export, lda"
+      error "Valid steps: sync_releases, load_map, load_lizard, ingest_churn, extract_jira, transform, export, lda"
       exit 1
       ;;
   esac
@@ -198,6 +211,7 @@ else
 
   step_sync_releases
   step_load_map
+  step_load_lizard
   step_ingest_churn
   step_extract_jira
   step_transform

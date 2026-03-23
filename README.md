@@ -9,12 +9,12 @@ Release analytics for Liferay DXP built around two goals:
 
 ## Overview
 
-The platform ingests data from four systems — Jira, Testray, SonarQube, and git history — transforms it into a PostgreSQL database, and exports analysis-ready CSVs that power two Looker Studio dashboards. A separate branch risk scoring engine runs locally against a developer's portal checkout.
+The platform ingests data from four systems — Jira, Testray, lizard, and git history — transforms it into a PostgreSQL database, and exports analysis-ready CSVs that power two Looker Studio dashboards. A separate branch risk scoring engine runs locally against a developer's portal checkout.
 
 ```
 Jira (LPP/LPD)   ──┐
 Testray          ──┤
-SonarQube        ──┤──► PostgreSQL ──► export_looker.R ──► Google Sheets ──► Looker Studio
+lizard (CCN)     ──┤──► PostgreSQL ──► export_looker.R ──► Google Sheets ──► Looker Studio
 git churn CSVs   ──┘                       │
                                            └──► lda_analysis.R ──► topic PNGs + CSVs
 
@@ -45,7 +45,7 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
 | Bug Discovery Timing | How many days before/after customer reports did internal testing find the same issue? Positive = customer found first (bad). |
 | Topic Analysis | LDA topic modeling on bug summaries. Which themes dominate customer bugs vs internal bugs? Runs for three periods: all time, 2024 (pre-process change), 2025 (post-process change). |
 | Blind Spot Analysis | Terms appearing disproportionately in customer bugs vs internal bugs — signals where internal testing coverage may be misaligned. |
-| Complexity & Tech Debt | SonarQube-derived complexity, violation counts, and tech debt hours by component and team. Note: Commerce sub-components share a codebase — metrics are distributed equally across them. |
+| Complexity & Tech Debt | lizard-derived cyclomatic complexity (CCN) and NLOC by component and team, split by Java vs frontend. Note: Commerce sub-components share a codebase — metrics are distributed equally across them. |
 
 ---
 
@@ -56,8 +56,8 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
 | **Jira LPP** | Customer-reported bugs (`project = LPP`) from 2024.Q1 onwards. Assigned to quarters via `affectedVersion`. | Jira REST API v3 `/search/jql` |
 | **Jira LPD** | Internal bugs (`project = LPD`) from 2023-11-05 onwards. Assigned to quarters via `created_date` → dev window lookup. Release blockers flagged via `labels = "release-blocker"`. | Jira REST API v3 `/search/jql` |
 | **Testray** | Test case pass/fail history, bug linkage, catch rates. 150GB backup loaded into local `testray_analysis` PostgreSQL DB. | PostgreSQL → `extract_testray.R` |
-| **SonarQube** | Cyclomatic complexity, cognitive complexity, violation counts, tech debt by file. | Local SonarQube analysis → SonarQube API → `extract_sonarqube.R` |
-| **Git churn** | Java, TypeScript, JSX, SCSS insertions/deletions per module per quarter and U release. | Pre-computed CSVs in `data/` → `ingest_churn_csv.R` |
+| **lizard** | Cyclomatic complexity (CCN) and NLOC by function, aggregated to file level. Java and frontend (JS/TS/JSX/TSX) scored separately. Excludes third-party, ANTLR-generated, and OSB modules. | `lizard` CLI → `data/lizard_output_YYYYMMDD.csv` → `utils/load_lizard.R` |
+| **Git churn** | Java, TypeScript, JSX, SCSS insertions/deletions per module per quarter and U release. | Pre-computed CSVs in `data/` → `utils/ingest_churn_csv.R` |
 
 ---
 
@@ -75,20 +75,23 @@ liferay-release-analytics/
 │   └── releases.yml                # Release registry (edit to add new releases)
 ├── data/
 │   ├── churn_by_module_Q.csv       # Cumulative churn per Q release
-│   └── churn_by_module_U.csv       # Incremental churn per U release
+│   ├── churn_by_module_U.csv       # Incremental churn per U release
+│   └── lizard_output_YYYYMMDD.csv  # lizard function-level complexity output
 ├── db/
 │   └── migrations/                 # Schema version history
 ├── extract/                        # Pull raw data from source systems
 │   ├── extract_jira.R
 │   ├── extract_testray.R
-│   ├── extract_sonarqube.R
+│   ├── extract_sonarqube.R         # RETIRED — replaced by lizard + load_lizard.R
 │   ├── extract_churn.sh
 │   └── extract_git.R               # Automated churn extraction (in development)
 ├── transform/                      # Clean and shape raw data
+│   ├── transform_complexity.R      # RETIRED — replaced by utils/load_lizard.R
 │   └── transform_forecast_input.R  # Rolls up LPP/LPD/blockers to component × quarter
 ├── utils/                          # Pipeline utilities
 │   ├── sync_releases.R             # Syncs releases.yml → dim_release
 │   ├── load_module_component_map.R # Seeds dim_component and dim_module_component_map
+│   ├── load_lizard.R               # Loads lizard CSV → stg_lizard_raw → fact_file_complexity
 │   ├── ingest_churn_csv.R          # Seeds churn into fact_forecast_input
 │   └── export_looker.R             # Exports all CSVs for Looker Studio
 ├── reports/
@@ -112,7 +115,8 @@ liferay-release-analytics/
 
 - R 4.x with the following packages: `dplyr`, `tidyr`, `readr`, `DBI`, `RPostgres`, `yaml`, `httr`, `jsonlite`, `logger`, `glue`, `MASS`, `randomForest`, `tidytext`, `topicmodels`, `ggplot2`, `flexdashboard`, `DT`, `crosstalk`, `htmltools`
 - PostgreSQL 14+
-- Access to Jira, SonarQube, and Testray (or a copy of the database — see below)
+- lizard: `pipx install lizard` (for regenerating complexity — not required to run the dashboard pipeline against an existing snapshot)
+- Access to Jira and Testray (or a copy of the database — see below)
 
 ### Database
 
@@ -123,14 +127,15 @@ psql -U postgres -c "CREATE DATABASE release_analytics;"
 psql -U postgres -d release_analytics -f db/schema.sql
 psql -U postgres -d release_analytics -f db/migrations/migration_1.3.sql
 psql -U postgres -d release_analytics -f db/migrations/migration_1.4.sql
+psql -U postgres -d release_analytics -f db/migrations/migration_1.5.sql
+psql -U postgres -d release_analytics -f db/migrations/migration_1.6.sql
 ```
 
 **Don't want to run the full pipeline?** You can request a database snapshot from [@nikki-pru]. This gives you a pre-populated database you can query directly or use to render the dashboards without re-running all extracts.
 
-
 ### Database snapshot (recommended for contributors)
 
-Rather than running the full pipeline, you can request a database snapshot from [@nikki-pru] and restore it locally. This gives you a fully populated database in minutes.
+Rather than running the full pipeline, you can request a database snapshot from [@nikki-pru] and restore it locally.
 
 **Request:** Reach out to get the latest `release_analytics_YYYYMMDD.dump` file.
 
@@ -157,13 +162,37 @@ pg_restore -U postgres -d release_analytics -F c --no-owner --no-privileges rele
 - `dim_component` — 240 components across 15 teams
 - `dim_module_component_map` — 779 module → component mappings
 - `fact_forecast_input` — churn + bug counts per component × quarter
-- `fact_file_complexity` — SonarQube metrics per file
+- `fact_file_complexity` — lizard complexity metrics per file (avg_ccn, avg_nloc, Java/frontend split)
 - `fact_test_quality` — Testray bug catch rates per test case
-- `dim_file` — 39,413 file registry entries
+- `dim_file` — 58,881 file registry entries
+- `dim_module` — with `module_path_full` and `module_path_category` join keys
 
 **What's NOT included:**
 - Raw Testray case results (150GB source — available separately on request)
 - Your local credentials (`config/config.yml`)
+- `lizard_output_YYYYMMDD.csv` (regenerate with `lizard` CLI — see below)
+
+### Regenerating lizard complexity
+
+lizard complexity data is not included in the snapshot (CSV is too large). To regenerate:
+
+```bash
+# Install lizard
+pipx install lizard
+
+# Run from liferay-portal root
+lizard ./modules \
+  --languages java javascript typescript \
+  --CCN 1 --length 1 \
+  --output_file lizard_output_$(date +%Y%m%d).csv \
+  -x '*/node_modules/*' -x '*/build/*' -x '*/dist/*' \
+  -x '*/.gradle/*' -x '*/gradleTest/*' \
+  -x '*/test/*' -x '*/testIntegration/*'
+
+# Copy CSV to liferay-release-analytics/data/
+# Then load:
+Rscript utils/load_lizard.R
+```
 
 ### Config
 
@@ -210,18 +239,27 @@ Run all scripts from the **project root** (`~/dev/projects/liferay-release-analy
 bash run_pipeline.sh
 ```
 
+Options:
+- `--skip-jira` — use cached Jira data
+- `--skip-lizard` — skip complexity reload (use existing `fact_file_complexity`)
+- `--skip-export` — skip Looker CSV export
+- `--run-lda` — include LDA topic analysis (~5 min)
+- `--step STEP` — run a single step only
+- `--dry-run` — preview steps without executing
+
+Steps: `sync_releases`, `load_map`, `load_lizard`, `ingest_churn`, `extract_jira`, `transform`, `export`, `lda`
+
 Or run steps individually in R from the project root:
 
 ```r
 source("utils/sync_releases.R")
 source("utils/load_module_component_map.R")
+Rscript utils/load_lizard.R          # complexity — run as script
 source("utils/ingest_churn_csv.R")
 source("extract/extract_jira.R")
 source("transform/transform_forecast_input.R")
 source("utils/export_looker.R")
 ```
-
-> `run_pipeline.sh` executes all steps in order with logging. See the script for options.
 
 ### Topic analysis (run separately, takes ~5 minutes)
 
@@ -261,7 +299,7 @@ Five signals with composite weights:
 
 | Signal | Weight | Source |
 |---|---|---|
-| Code complexity | 28% | SonarQube |
+| Code complexity | 28% | lizard CCN (cyclomatic), NLOC as cognitive proxy |
 | Churn | 25% | Git diff |
 | Defects | 20% | Jira LPD history |
 | Test coverage | 15% | Testray |
@@ -276,37 +314,35 @@ cd /path/to/liferay-portal
 bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh --branch your-branch-name
 ```
 
-By default, test execution and compilation are skipped for speed. Opt in explicitly:
-
-Flags:
-- `--run-test` — run `ant test-class -Dtest.class=ModulesStructureTest`
-- `--run-compile` — run `gw clean deploy` on affected modules
-
-Output: a risk score (0–100) per affected module with signal breakdown.
-
 ---
 
 ## Key Design Decisions
 
 ### Tech Stack
 
-**Why R?** The analytics core — LDA topic modeling, count regression, text mining — maps naturally to R's statistical ecosystem (`topicmodels`, `MASS`, `tidytext`). Outputs go to Looker Studio via CSV so the language is invisible to end users. A Python rewrite would be the right call if the scoring engine needs to be exposed as a microservice or if the automation team needs to maintain the pipeline.
+**Why R?** The analytics core — LDA topic modeling, count regression, text mining — maps naturally to R's statistical ecosystem (`topicmodels`, `MASS`, `tidytext`). Outputs go to Looker Studio via CSV so the language is invisible to end users.
+
+### Complexity Tooling
+
+**Why lizard instead of SonarQube?** SonarQube's strength is the full quality gate — violations, coverage, security — none of which are needed for release risk scoring. lizard runs locally, outputs directly to CSV, and is significantly faster on the liferay-portal codebase. CCN from lizard is a direct equivalent to SonarQube's cyclomatic complexity; NLOC serves as a cognitive load proxy.
+
+Excluded from complexity scoring: `modules/third-party/`, ANTLR-generated parser files (`/antlr/`), and `modules/dxp/apps/osb/` (extra nesting depth, zero component mappings).
 
 ### Bug Forecasting
 
-**Why historical ranking instead of LPP forecasting?** 62% of component×quarter rows have zero LPP bugs. With only 5 mature training quarters available, count models produce unreliable predictions. LPP is shown as a percentile ranking based on historical exposure + current churn. This improves as more mature quarters accumulate.
+**Why historical ranking instead of LPP forecasting?** 62% of component×quarter rows have zero LPP bugs. With only 5 mature training quarters available, count models produce unreliable predictions. LPP is shown as a percentile ranking based on historical exposure + current churn.
 
-**Why a maturity filter on LPD training?** Quarters with fewer than 9 months in field have incomplete bug counts — customers haven't had enough time to report issues. Training on immature quarters inverts the churn→bug signal. Only quarters with `months_in_field >= 9` are used for model training.
+**Why a maturity filter on LPD training?** Quarters with fewer than 9 months in field have incomplete bug counts. Only quarters with `months_in_field >= 9` are used for model training.
 
 ### LDA / Topic Modeling
 
-**Why separate 2024 and 2025 LDA runs?** A process change in early 2024 makes the two years' bug populations not directly comparable as a training corpus. The 2024 vs 2025 topic divergence is itself a finding worth showing — it documents how the process change shifted what kinds of bugs were being reported and caught.
+**Why separate 2024 and 2025 LDA runs?** A process change in early 2024 makes the two years' bug populations not directly comparable. The 2024 vs 2025 topic divergence is itself a finding worth showing.
 
 ---
 
 ## About This Project
 
-Project conception, analytical direction, methodology, data-sourcing, and domain expertise are by the Liferay Release Team. 
+Project conception, analytical direction, methodology, data-sourcing, and domain expertise are by the Liferay Release Team.
 Code generation and implementation is supported with Claude (Anthropic).
 
 For database access or questions about the platform reach out directly to @nikki-pru
