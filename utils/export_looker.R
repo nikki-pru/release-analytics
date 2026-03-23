@@ -261,8 +261,8 @@ pred_results <- fd %>%
     lpd_pred      = round(lpd_preds, 2),
     lpd_pct       = round(percent_rank(lpd_preds) * 100, 1),
     lpd_risk_level= risk_label(lpd_pct),
-    risk_score    = round(lpp_hist_score + lpd_pct, 1),
-    overall_risk  = risk_label(percent_rank(lpp_hist_score + lpd_pct) * 100),
+    risk_score    = round((lpp_hist_score + lpd_pct) / 2, 1),
+    overall_risk  = risk_label(percent_rank((lpp_hist_score + lpd_pct) / 2) * 100),
     model_name    = best_name,
     model_r2      = best_r2,
     model_cal     = round(lpd_cal, 3),
@@ -404,7 +404,7 @@ forecast_by_component <- forecast_by_component %>%
     ),
     lpd_risk_level = ifelse(is.na(lpd_risk_level), risk_label(lpd_pct), lpd_risk_level),
     risk_score     = ifelse(is.na(risk_score),
-                            round(coalesce(lpp_hist_score, 0) + lpd_pct, 1), risk_score),
+                            round((coalesce(lpp_hist_score, 0) + lpd_pct) / 2, 1), risk_score),
     overall_risk   = ifelse(is.na(overall_risk),
                             risk_label(percent_rank(risk_score) * 100), overall_risk)
   ) %>%
