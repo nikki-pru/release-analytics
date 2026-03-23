@@ -732,6 +732,12 @@ if (!file.exists(jira_path)) {
       pct        = round(n / total * 100, 1)
     ) %>%
     ungroup() %>%
+    # Join release_date from dim_release so Looker can use a proper Date
+    # field for the time series axis instead of the Text quarter field
+    left_join(
+      releases %>% dplyr::select(release_label, release_date),
+      by = c("quarter" = "release_label")
+    ) %>%
     arrange(quarter, project, severity_order)
 
   write_export(severity_distribution, dir_landscape, "L01_severity_distribution.csv")
@@ -829,6 +835,12 @@ if (!file.exists(jira_path)) {
       lpd_n    = coalesce(lpd_n, 0L),
       prop_diff_lpp_minus_lpd = round(lpp_prop - lpd_prop, 6),
       prop_diff_lpd_minus_lpp = round(lpd_prop - lpp_prop, 6),
+      # Ratio of customer to internal mention rate
+      # High ratio + sufficient lpp_n = actionable blind spot
+      # NA when lpd_prop is zero to avoid divide-by-zero inflation
+      lpp_lpd_ratio = round(
+        ifelse(lpd_prop > 0, lpp_prop / lpd_prop, NA_real_), 1
+      ),
       # Words appearing MORE in customer bugs = potential blind spots
       blind_spot_type = case_when(
         prop_diff_lpp_minus_lpd > 0.001 ~ "Customer only",
@@ -836,8 +848,8 @@ if (!file.exists(jira_path)) {
         TRUE                            ~ "Shared"
       )
     ) %>%
-    filter(lpp_n + lpd_n >= 5) %>%   # minimum frequency threshold
-    arrange(desc(prop_diff_lpp_minus_lpd))
+    filter(lpp_n >= 10) %>%
+    arrange(desc(lpp_lpd_ratio))
 
   write_export(blind_spots, dir_landscape, "L03_blind_spot_analysis.csv")
 
