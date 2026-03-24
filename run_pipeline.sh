@@ -19,6 +19,7 @@
 #   load_map
 #   load_lizard
 #   ingest_churn
+#   feature_flags
 #   extract_jira
 #   transform
 #   export
@@ -47,6 +48,7 @@ RSCRIPT="Rscript --vanilla"
 # -----------------------------------------------------------------------------
 SKIP_JIRA=false
 SKIP_LIZARD=false
+SKIP_FEATURE_FLAGS=false
 SKIP_EXPORT=false
 RUN_LDA=false
 DRY_RUN=false
@@ -55,7 +57,8 @@ SINGLE_STEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-jira)    SKIP_JIRA=true;    shift ;;
-    --skip-lizard)  SKIP_LIZARD=true;  shift ;;
+    --skip-lizard)       SKIP_LIZARD=true;        shift ;;
+    --skip-feature-flags) SKIP_FEATURE_FLAGS=true; shift ;;
     --skip-export)  SKIP_EXPORT=true;  shift ;;
     --run-lda)      RUN_LDA=true;      shift ;;
     --dry-run)      DRY_RUN=true;      shift ;;
@@ -127,8 +130,9 @@ info "Project root: $PROJECT_ROOT"
 info "Log: $LOG_FILE"
 [[ "$DRY_RUN"    == true ]] && info "Mode: DRY RUN"
 [[ "$SKIP_JIRA"   == true ]] && info "Skipping Jira extraction"
-[[ "$SKIP_LIZARD" == true ]] && info "Skipping lizard complexity load"
-[[ "$SKIP_EXPORT" == true ]] && info "Skipping Looker export"
+[[ "$SKIP_LIZARD"        == true ]] && info "Skipping lizard complexity load"
+[[ "$SKIP_FEATURE_FLAGS" == true ]] && info "Skipping feature flag dampening"
+[[ "$SKIP_EXPORT"        == true ]] && info "Skipping Looker export"
 [[ "$RUN_LDA"    == true ]] && info "LDA topic analysis enabled"
 [[ -n "$SINGLE_STEP" ]]    && info "Single step mode: $SINGLE_STEP"
 info "============================================================"
@@ -151,6 +155,14 @@ step_load_lizard() {
 
 step_ingest_churn() {
   run_r "ingest_churn_csv" "utils/ingest_churn_csv.R"
+}
+
+step_feature_flags() {
+  if [[ "$SKIP_FEATURE_FLAGS" == true ]]; then
+    warn "Skipping feature flag dampening (--skip-feature-flags)"
+    return 0
+  fi
+  run_r "apply_feature_flag_dampening" "utils/apply_feature_flag_dampening.R"
 }
 
 step_extract_jira() {
@@ -195,13 +207,14 @@ if [[ -n "$SINGLE_STEP" ]]; then
     load_map)       step_load_map ;;
     load_lizard)    step_load_lizard ;;
     ingest_churn)   step_ingest_churn ;;
+    feature_flags)  step_feature_flags ;;
     extract_jira)   step_extract_jira ;;
     transform)      step_transform ;;
     export)         step_export ;;
     lda)            RUN_LDA=true; step_lda ;;
     *)
       error "Unknown step: $SINGLE_STEP"
-      error "Valid steps: sync_releases, load_map, load_lizard, ingest_churn, extract_jira, transform, export, lda"
+      error "Valid steps: sync_releases, load_map, load_lizard, ingest_churn, feature_flags, extract_jira, transform, export, lda"
       exit 1
       ;;
   esac
@@ -213,6 +226,7 @@ else
   step_load_map
   step_load_lizard
   step_ingest_churn
+  step_feature_flags
   step_extract_jira
   step_transform
   step_export
