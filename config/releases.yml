@@ -429,7 +429,7 @@ releases:
     notes:            ""
 
   # ---------------------------------------------------------------------------
-  # 2026.Q1 — Active
+  # 2026.Q1
   # ---------------------------------------------------------------------------
 
   - label:            "U144"
@@ -465,7 +465,7 @@ releases:
     release_date:     "2026-03-16"
     is_major_release: false
     is_lts:           false
-    status:           IN_DEVELOPMENT
+    status:           RELEASED
     notes:            "Promoted to 2026.Q1 release"
 
   - label:            "2026.Q1"
@@ -474,6 +474,29 @@ releases:
     release_date:     "2026-03-18"
     is_major_release: true
     is_lts:           true
+    status:           RELEASED
+    notes:            ""
+
+
+  # ---------------------------------------------------------------------------
+  # 2026.Q2 - Active
+  # ---------------------------------------------------------------------------
+  
+  - label:            "U148"
+    quarter_label:    "2026.Q2"
+    git_tag:          "7.4.13-u148"
+    release_date:     ""
+    is_major_release: false
+    is_lts:           false
+    status:           IN_DEVELOPMENT
+    notes:            ""
+
+  - label:            "2026.Q2"
+    quarter_label:    "2026.Q2"
+    git_tag:          "2026.q2.0"
+    release_date:     "2026-05-18"
+    is_major_release: true
+    is_lts:           false
     status:           IN_DEVELOPMENT
     notes:            ""
 
