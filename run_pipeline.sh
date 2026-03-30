@@ -153,6 +153,10 @@ step_load_lizard() {
   run_r "load_lizard" "utils/load_lizard.R"
 }
 
+step_load_testray() {
+  run_r "load_testray" "utils/load_testray.R"
+}
+
 step_ingest_churn() {
   run_r "ingest_churn_csv" "utils/ingest_churn_csv.R"
 }
@@ -206,6 +210,7 @@ if [[ -n "$SINGLE_STEP" ]]; then
     sync_releases)  step_sync_releases ;;
     load_map)       step_load_map ;;
     load_lizard)    step_load_lizard ;;
+    load_testray)   step_load_testray ;;
     ingest_churn)   step_ingest_churn ;;
     feature_flags)  step_feature_flags ;;
     extract_jira)   step_extract_jira ;;
@@ -225,6 +230,7 @@ else
   step_sync_releases
   step_load_map
   step_load_lizard
+  step_load_testray
   step_ingest_churn
   step_feature_flags
   step_extract_jira
