@@ -24,6 +24,8 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score (st
 
 **Why R:** LDA topic modeling, count regression, text mining map naturally to R's statistical ecosystem (`topicmodels`, `MASS`, `tidytext`). Outputs are CSVs — the language is invisible to end users.
 
+**Pending move to Python for accessibility to a wider pool of Engineers**
+
 ---
 
 ## Dashboards
