@@ -1,15 +1,14 @@
 # Liferay Release Analytics
 
-Release analytics for Liferay DXP built around two goals:
+Release analytics for Liferay DXP. The platform serves three distinct use cases:
 
-- **Before release:** Determine where testing effort should be focused.
-- **After release:** Learn from what escaped to get better for the next cycle.
+- **Dashboard pipeline:** Export analysis-ready CSVs that power Looker Studio dashboards for release planning and post-release review.
+- **Branch risk scoring:** Evaluate a pull request against a local portal checkout and return a composite risk score before merge.
+- **Ad hoc analysis:** Query the PostgreSQL database directly, or run standalone R scripts, for deeper investigation — complexity trends, LDA topic modeling, fix management conflict analysis, Testray new test failures.
 
 ---
 
 ## Overview
-
-The platform ingests data from four systems — Jira, Testray, lizard, and git history — transforms it into a PostgreSQL database, and exports analysis-ready CSVs that power two Looker Studio dashboards. A separate branch risk scoring engine runs locally against a developer's portal checkout.
 
 ```
 Jira (LPP/LPD)   ──┐
@@ -18,8 +17,12 @@ lizard (CCN)     ──┤──► PostgreSQL ──► export_looker.R ──�
 git churn CSVs   ──┘                       │
                                            └──► lda_analysis.R ──► topic PNGs + CSVs
 
-liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
+liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score (standalone)
 ```
+
+**Stack:** R (analytics core), PostgreSQL 14+, Looker Studio, Google Sheets, lizard CLI
+
+**Why R:** LDA topic modeling, count regression, text mining map naturally to R's statistical ecosystem (`topicmodels`, `MASS`, `tidytext`). Outputs are CSVs — the language is invisible to end users.
 
 ---
 
@@ -31,9 +34,10 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
 | Page | Contents |
 |---|---|
 | Bug Forecast | Predicted internal defects (LPD) per component. Random Forest model, R²=0.56, validated on most recent mature quarter. LPP shown as historical risk ranking — forecasting not viable at current data volume. |
+| Team Release Story | Single-page team one-pager. Signal → Story → Stakes structure: Headline Bar, Where You Stand, Risk Heat Map (S01), Stakes/Forecast (`lpp_hist_score` vs `lpd_pred` with actuals). Switchable by team. |
 | Risk Heat Map | Heatmap of risk indicators per component: historical customer bug exposure, historical internal defects, backend churn, frontend churn, Java insertions, TSX insertions. |
 | Churn Trends | Code churn by quarter and team — backend vs frontend split. Covers all U and Q releases. |
-| Team Scorecard | Per-team: LPP count, LPD count, release blocker count, acceptance test catch rate, release test catch rate. Designed for quadrant analysis: high LPD + low LPP = catching bugs before customers. High LPP + high pass rate = testing the wrong things. |
+| Team Scorecard | Per-team: LPP count, LPD count, release blocker count, acceptance test catch rate, release test catch rate. Quadrant analysis: high LPD + low LPP = catching bugs before customers; high LPP + high pass rate = testing the wrong things. |
 | Model Notes | LPD model R², MAE, validation quarter, calibration factor. LPP data maturity note. |
 
 ### Release Landscape Report
@@ -43,9 +47,89 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
 |---|---|
 | Severity Distribution | LPP vs LPD severity breakdown by quarter. Are we catching high-priority bugs internally before they reach customers? |
 | Bug Discovery Timing | How many days before/after customer reports did internal testing find the same issue? Positive = customer found first (bad). |
-| Topic Analysis | LDA topic modeling on bug summaries. Which themes dominate customer bugs vs internal bugs? Runs for three periods: all time, 2024 (pre-process change), 2025 (post-process change). |
-| Blind Spot Analysis | Terms appearing disproportionately in customer bugs vs internal bugs — signals where internal testing coverage may be misaligned. |
-| Complexity & Tech Debt | lizard-derived cyclomatic complexity (CCN) and NLOC by component and team, split by Java vs frontend. Note: Commerce sub-components share a codebase — metrics are distributed equally across them. |
+| Language Blind Spots | Terms appearing disproportionately in customer bugs vs internal bugs — signals where internal testing coverage may be misaligned. |
+| Complexity & Tech Debt | lizard-derived CCN and NLOC by component and team, split by Java vs frontend. Note: Commerce sub-components share a codebase — metrics are distributed equally across them. |
+| Topic Analysis | LDA topic modeling on bug summaries. Which themes dominate customer bugs vs internal bugs? Three periods: all time, 2024 (pre-process change), 2025 (post-process change). Filter by `period` field (not `year`). |
+
+---
+
+## Branch Risk Scoring Engine
+
+A standalone scoring engine that evaluates risk for a specific pull request against a local `liferay-portal` checkout. Independent of the dashboard pipeline — runs locally against a developer's branch.
+
+### What it scores
+
+Five signals with composite weights:
+
+| Signal | Weight | Source |
+|---|---|---|
+| Code complexity | 28% | lizard CCN (cyclomatic), NLOC as cognitive proxy |
+| Churn | 25% | Git diff |
+| Defects | 20% | Jira LPD history |
+| Test coverage | 15% | Testray |
+| Dependencies | 12% | OSGi module graph — blast radius (incoming) + integration depth (outgoing), blended 60/40 |
+
+### Running it
+
+```bash
+cd /path/to/liferay-portal
+bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh --branch your-branch-name
+```
+
+---
+
+## Ad Hoc Analysis
+
+The PostgreSQL database is the primary artifact — the pipeline populates it; the dashboards read from it; but it can also be queried directly for investigations that don't fit the dashboard format.
+
+### Fix Management conflict analysis
+
+`FixManagementAnalysis.R` (and the accompanying `FixManagementDashboard.Rmd` Flexdashboard) covers LPP Fix Management conflict tickets with paginated Jira extraction, LDA topic modeling, TF-IDF component signatures, LPD co-occurrence, and version normalization. Run independently of the main pipeline. A Docker deployment is available for the Flexdashboard.
+
+```r
+source("reports/fix_management/FixManagementAnalysis.R")
+```
+
+### Complexity deep dives
+
+`fact_file_complexity` holds lizard CCN and NLOC at file level with Java/frontend splits. Join to `dim_component` via `dim_module_component_map` for component-level queries. Useful for identifying files where `max_ccn` exceeds the p95 threshold (16) and correlating against elevated LPD counts — particularly in high-churn components like Objects and Web Content.
+
+Key fields: `avg_ccn`, `max_ccn`, `avg_nloc`, `avg_ccn_java`, `avg_ccn_frontend`, `language_mix`.
+
+### LDA topic modeling (standalone)
+
+Topic analysis runs separately from the main pipeline (~5 minutes). Outputs topic PNGs and CSVs to `reports/release_landscape/exports/`.
+
+```r
+source("reports/release_landscape/lda_analysis.R")
+```
+
+Outputs land in `topics_2024/`, `topics_2025/`, and `topics_all_time/` under the exports directory.
+
+### Testray: new test failures against a git diff
+
+The `fact_test_quality` table links Testray test cases to bug outcomes and catch rates. Two routine signals are tracked:
+
+| Signal | Routine ID | Cadence |
+|---|---|---|
+| Acceptance | 590307 | Daily |
+| Release | 82964 | Pre-ship |
+
+These can be queried to surface test cases that are newly failing — i.e., cases with recent first-failure dates not previously associated with a known bug — which is useful for triaging whether a new failure represents a real regression or test environment noise.
+
+**Triage pipeline (in progress):** A lightweight pipeline cross-references new failures against a git diff to classify likely causes before handing off to AI for reasoning. No MCP infrastructure required — the temporary workflow is:
+
+  Query the database comparing two build pairs
+  
+  -> new failures are returned 
+  
+  -> Extract git changed files and classes from the branch are reviewed 
+  
+  -> cross-reference failing test class names against the changed file list and classify each failure
+  
+  -> Paste the classified output and diff for reasoning: distinguish likely regressions from environment noise, suggest which failures warrant a bug, and identify patterns across the failure set.
+
+Longer term, classified failure results feed into `pr_outcomes` in Release Analytics Platform providing labeled training data for the NN-based PR risk prediction layer.
 
 ---
 
@@ -56,7 +140,7 @@ liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score
 | **Jira LPP** | Customer-reported bugs (`project = LPP`) from 2024.Q1 onwards. Assigned to quarters via `affectedVersion`. | Jira REST API v3 `/search/jql` |
 | **Jira LPD** | Internal bugs (`project = LPD`) from 2023-11-05 onwards. Assigned to quarters via `created_date` → dev window lookup. Release blockers flagged via `labels = "release-blocker"`. | Jira REST API v3 `/search/jql` |
 | **Testray** | Test case pass/fail history, bug linkage, catch rates. 150GB backup loaded into local `testray_analysis` PostgreSQL DB. | PostgreSQL → `extract_testray.R` |
-| **lizard** | Cyclomatic complexity (CCN) and NLOC by function, aggregated to file level. Java and frontend (JS/TS/JSX/TSX) scored separately. Excludes third-party, ANTLR-generated, and OSB modules. | `lizard` CLI → `data/lizard_output_YYYYMMDD.csv` → `utils/load_lizard.R` |
+| **lizard** | Cyclomatic complexity (CCN) and NLOC by function, aggregated to file level. Java and frontend (JS/TS/JSX/TSX) scored separately. Excludes third-party, ANTLR-generated, and OSB modules. CCN capped at 100. | `lizard` CLI → `data/lizard_output_YYYYMMDD.csv` → `utils/load_lizard.R` |
 | **Git churn** | Java, TypeScript, JSX, SCSS insertions/deletions per module per quarter and U release. | Pre-computed CSVs in `data/` → `utils/ingest_churn_csv.R` |
 
 ---
@@ -82,12 +166,12 @@ liferay-release-analytics/
 ├── extract/                        # Pull raw data from source systems
 │   ├── extract_jira.R
 │   ├── extract_testray.R
-│   ├── extract_sonarqube.R         # RETIRED — replaced by lizard + load_lizard.R
 │   ├── extract_churn.sh
 │   └── extract_git.R               # Automated churn extraction (in development)
+│   # extract_sonarqube.R — RETIRED, replaced by lizard
 ├── transform/                      # Clean and shape raw data
-│   ├── transform_complexity.R      # RETIRED — replaced by utils/load_lizard.R
 │   └── transform_forecast_input.R  # Rolls up LPP/LPD/blockers to component × quarter
+│   # transform_complexity.R — RETIRED, replaced by utils/load_lizard.R
 ├── utils/                          # Pipeline utilities
 │   ├── sync_releases.R             # Syncs releases.yml → dim_release
 │   ├── load_module_component_map.R # Seeds dim_component and dim_module_component_map
@@ -96,11 +180,15 @@ liferay-release-analytics/
 │   └── export_looker.R             # Exports all CSVs for Looker Studio
 ├── reports/
 │   ├── situation_deck/
-│   │   ├── release_situation_deck.Rmd   # R flexdashboard (local prototype)
+│   │   ├── release_situation_deck.Rmd   # R Flexdashboard (local prototype)
 │   │   └── exports/                     # S01–S07 CSVs → Google Sheets
-│   └── release_landscape/
-│       ├── lda_analysis.R               # Topic modeling — run separately
-│       └── exports/                     # L01–L05 CSVs + topic PNGs → Google Sheets
+│   ├── release_landscape/
+│   │   ├── lda_analysis.R               # Topic modeling — run separately (~5 min)
+│   │   └── exports/                     # L01–L05 CSVs + topic PNGs → Google Sheets
+│   └── fix_management/
+│       ├── FixManagementAnalysis.R      # Fix Management conflict analysis (standalone)
+│       ├── FixManagementDashboard.Rmd   # Flexdashboard with Docker deployment
+│       └── exports/                     # Output CSVs for Looker Studio export
 ├── scoring/                        # Branch risk scoring engine (standalone)
 │   ├── evaluate_pr.sh
 │   └── evaluate_pr.R
@@ -115,7 +203,7 @@ liferay-release-analytics/
 
 - R 4.x with the following packages: `dplyr`, `tidyr`, `readr`, `DBI`, `RPostgres`, `yaml`, `httr`, `jsonlite`, `logger`, `glue`, `MASS`, `randomForest`, `tidytext`, `topicmodels`, `ggplot2`, `flexdashboard`, `DT`, `crosstalk`, `htmltools`
 - PostgreSQL 14+
-- lizard: `pipx install lizard` (for regenerating complexity — not required to run the dashboard pipeline against an existing snapshot)
+- lizard: `pipx install lizard` (only needed to regenerate complexity from a fresh portal checkout — not required to run the dashboard pipeline against an existing snapshot)
 - Access to Jira and Testray (or a copy of the database — see below)
 
 ### Database
@@ -131,13 +219,11 @@ psql -U postgres -d release_analytics -f db/migrations/migration_1.5.sql
 psql -U postgres -d release_analytics -f db/migrations/migration_1.6.sql
 ```
 
-**Don't want to run the full pipeline?** You can request a database snapshot from [@nikki-pru]. This gives you a pre-populated database you can query directly or use to render the dashboards without re-running all extracts.
+**Don't want to run the full pipeline?** You can request a database snapshot from [@nikki-pru]. This gives you a pre-populated database you can query directly, run ad hoc analysis against, or use to render dashboards without re-running all extracts.
 
 ### Database snapshot (recommended for contributors)
 
-Rather than running the full pipeline, you can request a database snapshot from [@nikki-pru] and restore it locally.
-
-**Request:** Reach out to get the latest `release_analytics_YYYYMMDD.dump` file.
+**Request:** Reach out to @nikki-pru to get the latest `release_analytics_YYYYMMDD.dump` file.
 
 **Restore:**
 
@@ -162,10 +248,11 @@ pg_restore -U postgres -d release_analytics -F c --no-owner --no-privileges rele
 - `dim_component` — 240 components across 15 teams
 - `dim_module_component_map` — 779 module → component mappings
 - `fact_forecast_input` — churn + bug counts per component × quarter
-- `fact_file_complexity` — lizard complexity metrics per file (avg_ccn, avg_nloc, Java/frontend split)
+- `fact_file_complexity` — lizard complexity metrics per file (`avg_ccn`, `max_ccn`, `avg_nloc`, Java/frontend split)
 - `fact_test_quality` — Testray bug catch rates per test case
 - `dim_file` — 58,881 file registry entries
 - `dim_module` — with `module_path_full` and `module_path_category` join keys
+- `scoring_normalization` — p95 denominators for signal normalization; documents calibration decisions
 
 **What's NOT included:**
 - Raw Testray case results (150GB source — available separately on request)
@@ -174,7 +261,7 @@ pg_restore -U postgres -d release_analytics -F c --no-owner --no-privileges rele
 
 ### Regenerating lizard complexity
 
-lizard complexity data is not included in the snapshot (CSV is too large). To regenerate:
+lizard complexity data is not included in the snapshot (CSV is large). To regenerate:
 
 ```bash
 # Install lizard
@@ -247,7 +334,7 @@ Options:
 - `--step STEP` — run a single step only
 - `--dry-run` — preview steps without executing
 
-Steps: `sync_releases`, `load_map`, `load_lizard`, `ingest_churn`, `extract_jira`, `transform`, `export`, `lda`
+Steps in order: `sync_releases` → `load_map` → `load_lizard` → `ingest_churn` → `extract_jira` → `transform` → `export` → `lda`
 
 Or run steps individually in R from the project root:
 
@@ -261,7 +348,7 @@ source("transform/transform_forecast_input.R")
 source("utils/export_looker.R")
 ```
 
-### Topic analysis (run separately, takes ~5 minutes)
+### Topic analysis (run separately, ~5 minutes)
 
 ```r
 source("reports/release_landscape/lda_analysis.R")
@@ -289,44 +376,13 @@ Change `forecast_label` to any release in `dim_release` (e.g. `"U147"`, `"2025.Q
 
 ---
 
-## Branch Risk Scoring Engine
-
-A standalone scoring engine that evaluates risk for a specific pull request against a local `liferay-portal` checkout. Independent of the dashboard pipeline.
-
-### What it scores
-
-Five signals with composite weights:
-
-| Signal | Weight | Source |
-|---|---|---|
-| Code complexity | 28% | lizard CCN (cyclomatic), NLOC as cognitive proxy |
-| Churn | 25% | Git diff |
-| Defects | 20% | Jira LPD history |
-| Test coverage | 15% | Testray |
-| Dependencies | 12% | OSGi module graph |
-
-The dependency signal combines blast radius (incoming) and integration depth (outgoing critical connections), blended 60/40.
-
-### Running it
-
-```bash
-cd /path/to/liferay-portal
-bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh --branch your-branch-name
-```
-
----
-
 ## Key Design Decisions
 
-### Tech Stack
+### Complexity Signal
 
-**Why R?** The analytics core — LDA topic modeling, count regression, text mining — maps naturally to R's statistical ecosystem (`topicmodels`, `MASS`, `tidytext`). Outputs go to Looker Studio via CSV so the language is invisible to end users.
+**Why `max_ccn` instead of `avg_ccn_java`?** A single worst-case function better captures the tail risk that produces defects than a file-level average that smooths over it. The p95 denominator is fixed at 16 — lizard's warning threshold — with CCN capped at 100 before aggregation. These calibration decisions are recorded in `scoring_normalization` to prevent silent recalibration.
 
-### Complexity Tooling
-
-**Why lizard instead of SonarQube?** SonarQube's strength is the full quality gate — violations, coverage, security — none of which are needed for release risk scoring. lizard runs locally, outputs directly to CSV, and is significantly faster on the liferay-portal codebase. CCN from lizard is a direct equivalent to SonarQube's cyclomatic complexity; NLOC serves as a cognitive load proxy.
-
-Excluded from complexity scoring: `modules/third-party/`, ANTLR-generated parser files (`/antlr/`), and `modules/dxp/apps/osb/` (extra nesting depth, zero component mappings).
+**Why lizard instead of SonarQube?** SonarQube's strength is the full quality gate — violations, coverage, security — none of which are needed for release risk scoring. lizard runs locally, outputs directly to CSV, and is significantly faster on the liferay-portal codebase. CCN from lizard is a direct equivalent to SonarQube's cyclomatic complexity; NLOC serves as a cognitive load proxy. `tech_debt_minutes` is dashboard-display only and is not part of the scoring model.
 
 ### Bug Forecasting
 
@@ -336,7 +392,7 @@ Excluded from complexity scoring: `modules/third-party/`, ANTLR-generated parser
 
 ### LDA / Topic Modeling
 
-**Why separate 2024 and 2025 LDA runs?** A process change in early 2024 makes the two years' bug populations not directly comparable. The 2024 vs 2025 topic divergence is itself a finding worth showing.
+**Why separate 2024 and 2025 LDA runs?** A process change in early 2024 makes the two years' bug populations not directly comparable. The 2024 vs 2025 topic divergence is itself a finding worth surfacing.
 
 ---
 
@@ -345,4 +401,4 @@ Excluded from complexity scoring: `modules/third-party/`, ANTLR-generated parser
 Project conception, analytical direction, methodology, data-sourcing, and domain expertise are by the Liferay Release Team.
 Code generation and implementation is supported with Claude (Anthropic).
 
-For database access or questions about the platform reach out directly to @nikki-pru
+For database access or questions about the platform reach out directly to @nikki-pru.
