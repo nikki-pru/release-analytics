@@ -14,7 +14,7 @@ Release analytics for Liferay DXP. The platform serves three distinct use cases:
 Jira (LPP/LPD)   ──┐
 Testray          ──┤
 lizard (CCN)     ──┤──► PostgreSQL ──► export_looker.R ──► Google Sheets ──► Looker Studio
-git churn CSVs   ──┘                       │
+git churn        ──┘                       │
                                            └──► lda_analysis.R ──► topic PNGs + CSVs
 
 liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score (standalone)
