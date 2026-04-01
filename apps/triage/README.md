@@ -4,7 +4,7 @@ Triage app for the Liferay Release Analytics Platform.
 
 Answers the question: **"Which test failures in Build B are real bugs introduced since Build A?"**
 
-Part of the RAP three-app structure:
+Part of the Release Analytics Platform three-app structure:
 - `apps/scoring/`   — "How risky is this component?"
 - `apps/triage/`    — "Which failures are real bugs?" ← this app
 - `apps/dashboard/` — "How do we surface it?"
@@ -106,7 +106,7 @@ psql -U postgres -h localhost -d testray_working_db -c \
   "GRANT SELECT ON ALL TABLES IN SCHEMA public TO release;"
 ```
 
-### 4. RAP pipeline must have run first
+### 4. Release Analytics pipeline must have run first
 
 `dim_module_component_map` and `dim_component` must be populated:
 ```bash
@@ -195,7 +195,7 @@ app.properties, bnd.bnd, packageinfo, *.xml, *.properties, *.yml, *.yaml,
   Decisions pending: priority mapping, assignee strategy, dry-run mode.
   Run as separate manual step — not auto-triggered from `run_triage.sh`.
 
-- **RAP pipeline logging**: Improve `load_testray` step logging in `run_pipeline.sh`
+- **Release Analytics pipeline logging**: Improve `load_testray` step logging in `run_pipeline.sh`
   so it emits progress milestones instead of appearing to hang.
 
 - **Looker Studio Build Triage page**: Surface `fact_triage_results` as a new page

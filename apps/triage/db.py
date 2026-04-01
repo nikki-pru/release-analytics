@@ -3,7 +3,7 @@ apps/triage/db.py
 
 Database connections for the triage app.
 Provides connections to both:
-  - release_analytics  (RAP PostgreSQL — dim_module_component_map, dim_component, etc.)
+  - release_analytics  (Release Analytics Platform PostgreSQL — dim_module_component_map, dim_component, etc.)
   - testray_working_db (Testray PostgreSQL — build, caseresult, run, case)
 
 Credentials are never hardcoded — always read from config.yml.

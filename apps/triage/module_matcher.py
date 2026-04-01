@@ -29,7 +29,7 @@ from apps.triage.db import get_rap_conn, query_df
 
 
 # ---------------------------------------------------------------------------
-# Load lookup tables from RAP DB
+# Load lookup tables from Release Analytics DB
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
