@@ -22,8 +22,8 @@
 --        psql -U postgres -h localhost -d testray_working_db -f db/testray_setup.sql
 --
 --   4. Grant SELECT to analytics user:
---        psql -U postgres -h localhost -d testray_working_db \
---          -c "GRANT SELECT ON caseresult_working TO <analytics_user>;"
+        -- psql -U postgres -h localhost -d testray_working_db -c \
+        --     "GRANT SELECT ON ALL TABLES IN SCHEMA public TO release;"
 --
 --   config.yml does not need to change — databases.testray.dbname is always
 --   testray_working_db regardless of which backup date was restored.
