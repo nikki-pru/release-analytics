@@ -1,1 +1,139 @@
-# Placeholder — content to be provided separately.
+---
+name: triage
+description: >
+  Reference for the Liferay Testray regression triage workflow. Use this
+  skill whenever working on triage classification, interpreting
+  fact_triage_results, building labeled outcomes for pr_outcomes training,
+  or running either the batch pipeline or Claude Code workflow against a
+  Testray build pair. Trigger when the user mentions triage, regressions,
+  PASSED→FAILED, build pairs, culprit files, extract_relevant_hunks,
+  run_triage.sh, or fact_triage_results.
+---
+
+# Triage Skill
+
+## Purpose
+
+Classify Testray PASSED→FAILED regressions between two builds of a
+routine. Output feeds two consumers:
+
+1. **Investigation** — BUG cases generate LPD-Task tickets with culprit
+   file and rationale
+2. **Training data** — labeled BUG rows with culprit_file become supervised
+   signal for the NN-based PR risk prediction layer (backlog, pending
+   `pr_outcomes` population)
+
+## Classification rubric
+
+### BUG
+Code change in the build pair plausibly caused the failure. Requires:
+- A hunk in the diff that explains the failure, OR
+- A linked Jira ticket confirming the regression as a code defect, OR
+- Clean history before the build + consistent failure after + at least
+  one component-relevant change in the diff
+
+**Must name a `culprit_file` even at low confidence.**
+
+### FALSE_POSITIVE
+Not caused by code changes. Common patterns:
+- Flaky test (>30% intermittent failures across 20 recent runs in
+  unrelated contexts)
+- Environmental failure (DB, infrastructure, known CI issue)
+- Test was already failing on the base build — not a regression
+
+Culprit file is null. Rationale must state which pattern applies.
+
+### NEEDS_REVIEW
+Evidence genuinely insufficient for BUG or FALSE_POSITIVE within ~5
+tool calls. Escalate to human. Not a default — only when ambiguity
+remains after real investigation.
+
+## Schema: fact_triage_results
+
+| Column         | Type      | Notes                                              |
+|----------------|-----------|----------------------------------------------------|
+| case_id        | TEXT      | Testray case identifier                            |
+| build_pair_id  | TEXT      | {routine_id}_{build_a}_{build_b}                   |
+| classification | TEXT      | BUG | NEEDS_REVIEW | FALSE_POSITIVE                 |
+| confidence     | TEXT      | high | medium | low                                |
+| culprit_file   | TEXT      | nullable; required non-null for BUG                |
+| rationale      | TEXT      | plain language explanation                         |
+| tool_trace     | JSONB     | array of {tool, args, result_hash}                 |
+| classified_at  | TIMESTAMP |                                                    |
+| classifier     | TEXT      | batch:v1 | agent:claude-sonnet-4-6 | human          |
+
+Primary key: (case_id, build_pair_id, classifier) — allows multiple
+classifiers on the same case for comparison.
+
+## Tool contracts
+
+### tools/get_regressions.py
+```
+args:    routine_id, build_a, build_b
+returns: [{case_id, test_name, component, failure_msg}]
+```
+Returns PASSED→FAILED transitions between the two builds.
+
+### tools/get_test_history.py
+```
+args:    case_id, limit=20
+returns: [{build_id, routine, status, timestamp}] ordered desc
+```
+Used for flakiness detection. >30% failures in unrelated builds = flaky.
+
+### tools/get_hunks.py
+```
+args:    case_id, build_a, build_b
+returns: [{file_path, hunk_text, lines_changed}]
+```
+Wraps `extract_relevant_hunks.py`. Uses --exact path matching, splits
+on ` / ` with whitespace guard to avoid over-matching. If result exceeds
+~500 lines for one case, hunk extraction may be misconfigured — escalate.
+
+### tools/upsert_result.py
+```
+args: case_id, build_pair_id, classification, confidence,
+      culprit_file, rationale, tool_trace
+```
+Writes to `fact_triage_results`. Errors if record exists for this
+(case_id, build_pair_id, classifier) without --reclassify flag.
+
+## Batch pipeline reference
+
+The batch pipeline processes build pairs end-to-end:
+```
+run_triage.sh
+  → extract_relevant_hunks.py   (filter diff to relevant files)
+  → prompt_builder.py           (build classification prompts)
+  → triage_claude.py            (API calls, batched)
+  → store.py                    (upsert to fact_triage_results)
+```
+
+Output files land in `output/` (gitignored):
+- batch_N.md          raw classification responses per batch
+- triage_results.csv  flat export of classifications
+- git_diff_full.diff  full diff used for the run
+
+Classifier value for batch: `batch:v1`
+
+## Reproducibility
+
+Agent classification is not bit-for-bit reproducible across runs due to
+model sampling variance. Mitigations:
+- `tool_trace` column is the audit artifact — captures the full path taken
+- For training-data-grade labels, majority vote across 3 runs per case
+- Disagreement rate between batch and Claude Code classifiers on the same
+  build pair is a quality signal — report it at end of session
+- High disagreement = rubric ambiguity or systematic model bias, not error
+
+## Relationship to pr_outcomes (backlog)
+
+`fact_triage_results` BUG rows with non-null `culprit_file` are the
+labeled training data for a future NN-based PR risk prediction layer.
+Prerequisites before that layer is viable:
+1. Sufficient labeled history in `fact_triage_results`
+2. `pr_outcomes` table populated with post-merge defect outcomes
+3. Linkage: testray_case_id + githash → pr_outcomes
+
+Do not shortcut culprit_file attribution — label quality now determines
+model quality later.
