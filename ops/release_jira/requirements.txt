@@ -1,0 +1,2 @@
+-r ../utils/requirements.txt
+gitpython>=3.1.41
