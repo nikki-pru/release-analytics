@@ -1,0 +1,199 @@
+---
+name: liferay-release-analytics
+description: >
+  Full reference for the Liferay Release Analytics Platform (RAP) and all
+  sub-projects: RAP pipeline, Fix Management Analysis, Testray triage pipeline,
+  and Team Release Story one-pager. Trigger this skill whenever the user
+  mentions RAP, the pipeline, release analytics, risk scoring, the dashboards,
+  the situation deck, the landscape report, Testray triage, fix management,
+  the one-pager, export_looker, FixManagementAnalysis, churn, complexity,
+  LDA, LPD, LPP, pr_outcomes, or any S01–S07 / L01–L05 data files.
+  Always consult before writing or reviewing any R, SQL, or Python code for
+  this project. When in doubt, trigger — the cost of under-triggering is
+  wrong schema facts in generated code.
+---
+
+# Liferay Release Analytics — Unified Skill Reference
+
+This skill covers three active workstreams. Jump to the relevant section.
+
+- [RAP Pipeline & Dashboards](#rap-pipeline--dashboards)
+- [Fix Management Analysis](#fix-management-analysis)
+- [Testray Triage Pipeline](#testray-triage-pipeline)
+
+---
+
+## RAP Pipeline & Dashboards
+
+### Quick orientation
+
+| What | Where |
+|---|---|
+| Project root | `~/dev/projects/liferay-release-analytics/` |
+| DB | PostgreSQL `release_analytics` (local) |
+| Pipeline entry | `bash run_pipeline.sh` |
+| Export script | `utils/export_looker.R` (use v2 — see below) |
+| Data destination | Google Sheets → Looker Studio |
+| Two dashboards | Situation Deck (S-files) · Landscape Report (L-files) |
+
+### Architecture
+
+```
+Jira (LPP/LPD/Stories) ──┐
+Testray                  ──┤
+lizard (CCN/NLOC)        ──┤──► PostgreSQL ──► export_looker.R ──► Google Sheets ──► Looker Studio
+git churn CSVs           ──┤
+breaking changes         ──┘
+feature flags            ──► apply_feature_flag_dampening.R
+
+liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score (standalone)
+```
+
+### Key tables
+
+| Table | Grain | Key fields |
+|---|---|---|
+| `dim_release` | 1 per release | `release_label`, `release_date`, `is_major_release`, `is_lts`, `months_in_field`, `release_status` |
+| `dim_component` | 1 per component | 240 components, 15 teams |
+| `dim_module_component_map` | module → component | join key = `module_path` → `dim_module.module_path_full` |
+| `dim_module` | 1 per module | `module_path_full`, `module_path_category` |
+| `fact_forecast_input` | component × quarter | `churn_count`, `lpp_actual`, `lpd_actual`, `story_count`, `breaking_count`, `is_forecast_row`, `is_feature_flagged`, `churn_dampening_factor` |
+| `fact_file_complexity` | file (lizard snapshot) | `avg_ccn`, `max_ccn`, `avg_nloc`, `avg_ccn_java`, `avg_ccn_frontend`, `language_mix` |
+| `fact_test_quality` | test case | `routine_id` is key join field |
+| `fact_triage_results` | PR × case | triage pipeline output: `BUG / NEEDS_REVIEW / FALSE_POSITIVE` |
+| `stg_lizard_raw` | function-level staging | aggregated → `fact_file_complexity` |
+
+**Retired:** `fact_release_complexity` (SonarQube era)
+
+### Composite risk scores
+
+**Dashboard forecast (component × quarter):**
+- `lpp_hist_score` = 60% historical bug average + 40% churn signal, normalized 0–100
+- `lpd_pred` = Random Forest regression; requires `months_in_field >= 9`
+- `risk_score` = `(lpp_hist_score + lpd_pct) / 2`, range 0–100
+- `overall_risk` tier: Very High / High / Medium / Low / Very Low
+
+**PR Risk Scoring Engine (standalone):**
+
+| Signal | Weight |
+|---|---|
+| Code complexity (`max_ccn`) | 28% |
+| Churn | 25% |
+| Defects | 20% |
+| Test coverage | 15% |
+| Dependencies | 12% |
+
+- `max_ccn` p95 denominator = **16 (fixed)** — CCN capped at 100 before aggregation
+- Rationale in `scoring_normalization` — do not recalibrate silently
+
+### Testray routine IDs — never conflate
+
+| Signal | Routine ID | Cadence |
+|---|---|---|
+| Acceptance | 590307 | Daily |
+| Release | 82964 | Pre-ship |
+
+### Dashboard file map
+
+**Situation Deck (S-files):** P1 Bug Forecast, P2 Team Release Story, P3 Risk Heat Map, P4 Churn Trends, P5 Team Scorecard, P6 Model Notes
+
+**Landscape Report (L-files):** P1 Severity Distribution, P2 Bug Discovery Timing, P3 Language Blind Spots, P4 Complexity & Tech Debt, P5 Topic Analysis (filter by `period`, not `year`)
+
+### Team Release Story layout (single-page one-pager)
+
+| Row | Content |
+|---|---|
+| 1 – Headline Bar | avg_risk_score, risk tier, status |
+| 2 – Where You Stand | Landscape / Situation / Scorecard panels |
+| 3 – The Story | S01 risk heat map table |
+| 4 – Stakes/Forecast | lpp_hist_score vs lpd_pred with actuals |
+
+### Current status / known broken (April 2026)
+
+- Use `export_looker_v2.R` — do not run old `export_looker.R`
+- `is_forecast_row` = FALSE for all rows — fix pending in `transform_forecast_input.R`
+- Testray signals showing 0 — routine ID verification pending
+- U148 missing from `releases.yml` — re-run `sync_releases.R`
+- 2026.Q1 churn = 0 — re-run post-release
+- `churn_dampening_factor` stored but not consumed yet
+
+⚠️ **Do not re-run `export_looker.R` until upstream fixes are in place.**
+
+---
+
+## Fix Management Analysis
+
+### What it is
+
+Ad-hoc analysis of ~1,180 LPP Fix Management tickets (2024 Q1–2026 Q1), where customer hotfixes conflict with internal LPD fixes. Volume grew ~25x (48 tickets Q1 2024 → 1,208 Q1 2026).
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `FixManagementAnalysis.R` | Full pipeline — Jira fetch, plots, LDA, TF-IDF, CSV/RData export |
+| `FixManagementDashboard.Rmd` | Shiny flexdashboard, loads from RData (intentional split — avoids re-fetching) |
+| `output/fixmgmt_dashboard.RData` | Pre-computed R objects |
+| `output/raw_issues_cache.rds` | Cached Jira response — re-run from section 2 without re-fetching |
+| `export_fixmgmt.R` | Writes CSVs to `output/looker/fixmgmt/` |
+
+### Conflict data for RAP
+
+- File: `output/tables/component_freq.csv`
+- Columns: `value`, `n`
+- Filter rows containing `>` AND starting with `~`
+
+### Top findings
+
+- **LPD-64813 / LPD-64812 / LPD-64131** — highest-priority cluster; co-occur on most tickets; 7 customers × 6 versions; must be backported as an atomic unit
+- **Objects component** — structural conflict (field/relationship/localized changes), not individual bugs; requires architectural intervention
+- **Core Infrastructure** — security-driven (CVE), non-discretionary; needs dedicated capacity
+- **Web Content** — driven by LPD-57453 and LPD-48888; two bugs, high spread
+
+### Analytical method notes
+
+- **TF-IDF:** `LPD-XXXXX` tokens are ticket IDs — do NOT remove, they are valid component-LPD association signals
+- **LDA:** `removeNumbers` strips IDs from topics (intentional); terms are stemmed
+- **LDA topics (6):** patch/upgrade, security/localization, UI customization, patcher builds, web content rebases, LPE/catalog
+- **LPD Spread bubble chart:** lines are ggrepel label arrows, not data relationships; X = version reach, Y = customer reach, size = ticket count
+- **Docker:** `setwd` in Rmd setup chunk must be wrapped in `dir.exists()` guard or `try()` — else crash
+
+---
+
+## Testray Triage Pipeline
+
+### What it is
+
+Full bug triage pipeline for Testray Routine 82964 (Release). Identifies PASSED→FAILED regressions, filters git diffs to relevant files, classifies cases as `BUG / NEEDS_REVIEW / FALSE_POSITIVE`.
+
+### Key components
+
+| Component | Purpose |
+|---|---|
+| SQL queries | Identify PASSED→FAILED regressions |
+| `extract_relevant_hunks.py` | Filters git diff to relevant files using `--exact` path matching |
+| Claude (LLM layer) | Classifies each case across batches |
+| `fact_triage_results` | Upsert destination |
+
+### Path matching note
+
+`extract_relevant_hunks.py` splits on ` / ` (with whitespace) to avoid over-matching. Use `--exact` flag. The 595k-line full diff was filtered to 56 files / ~4,755 lines for routine 82964.
+
+### Long-term goal
+
+Feed `fact_triage_results` classifications into `pr_outcomes` as labeled training data for an NN-based PR risk prediction layer. Prerequisite for all supervised NN work: `pr_outcomes` populated with post-merge defect outcomes.
+
+---
+
+## Don't do these
+
+- Don't use `here::here()` — absolute paths from project root only
+- Don't call `get_db_connection()` with arguments — reads from `config.yml`
+- Don't store credentials anywhere — redirect to `config.yml`
+- Don't reference SonarQube — retired; lizard is the complexity source
+- Don't conflate Testray routine 590307 (acceptance) and 82964 (release)
+- Don't collapse `FixManagementAnalysis.R` and `FixManagementDashboard.Rmd`
+- Don't recalibrate `max_ccn` p95 = 16 silently — document in `scoring_normalization`
+- Don't remove ticket ID tokens from TF-IDF — they are valid signals
+- Don't treat `tech_debt_minutes` as a scoring input — display only
+- Don't filter LDA topic chart by `year` — use `period` field

@@ -1,0 +1,235 @@
+---
+name: fixmgmt-analysis
+description: >
+  Full reference for the Liferay Fix Management Conflict Analysis project. Use
+  this skill whenever someone uploads a screenshot from the Fix Management
+  Dashboard, asks about fix management ticket trends, LPD co-occurrence, TF-IDF
+  component signatures, LDA topics, the LPD spread bubble chart, or any chart
+  from this analysis. Also trigger when someone asks about the R script
+  (FixManagementAnalysis.R), the Flexdashboard (FixManagementDashboard.Rmd),
+  or the Docker setup for this dashboard. Use this skill to provide context,
+  interpret charts, and give recommendations grounded in the project's
+  methodology and findings.
+---
+
+# Fix Management Conflict Analysis — Project Reference
+
+## What this project is
+
+An ad-hoc analysis of Liferay LPP Fix Management tickets — a specific Jira
+ticket type created when a customer's hotfix conflicts with an internal fix
+(LPD), requiring a rebase, backport, or conflict resolution. The analysis was
+built by Nikki as part of the Release Quality function at Liferay, sitting
+under the broader Release Analytics Platform (RAP).
+
+**The core question:** Which fixes are generating the most downstream conflict
+work, which customers and versions are most affected, and what patterns explain
+the volume growth?
+
+---
+
+## File inventory
+
+| File | Purpose |
+|---|---|
+| `FixManagementAnalysis.R` | Full analysis pipeline — Jira fetch, parse, plots, LDA, TF-IDF, LPD co-occurrence, CSV/RData export |
+| `FixManagementDashboard.Rmd` | Flexdashboard (Shiny) — interactive dashboard loading from RData |
+| `output/fixmgmt_dashboard.RData` | Pre-computed R objects — loaded by dashboard, avoids re-fetching |
+| `output/raw_issues_cache.rds` | Cached raw Jira response — allows re-running from section 2 without re-fetching |
+| `export_fixmgmt.R` | Writes CSVs to `output/looker/fixmgmt/` for Google Drive → Looker Studio |
+| `Dockerfile` | Containerizes the dashboard — `docker build` + `docker run` opens it in a browser |
+| `README_docker.md` | Quickstart for running the dashboard via Docker |
+| `FixManagementDashboard_Quickstart.docx` | Step-by-step guide for non-R users running from command line |
+
+---
+
+## Data source
+
+- **Project:** LPP (customer-reported)
+- **Issue type:** Fix Management (conflict/rebase/hotfix tickets)
+- **JQL:** configured in `config/config.yml` under `jira.queries.lpp_fixMgmt`
+- **Fields fetched:** summary, priority, status, resolution, components, versions, reporter, created, resolutiondate, account_code (custom), cross_cutting (custom), fix_priority (custom field `customfield_10211`)
+- **LPD metadata:** fetched separately in section 11b, batched at 50 keys/request to avoid HTTP 414
+
+---
+
+## Key data facts
+
+- **Total tickets:** ~1,180
+- **Date range:** 2024 Q1 – 2026 Q1
+- **Volume trend:** 48 tickets in 2024 Q1 → 1,208 in 2026 Q1 (~25x growth)
+- **~60% of tickets** contain an explicit LPD reference in their summary
+- **Priority distribution:** skews Medium (~58%), with Fire outranking High+Critical combined — suggests inconsistent triage
+- **Resolution:** ~97% closed/done
+
+---
+
+## Dashboard pages
+
+| Page | What it shows |
+|---|---|
+| Overview | Value boxes + monthly volume, priority, status, resolution |
+| Volume by Quarter | Stacked bar with per-quarter LOESS trendlines; checkbox to filter which quarter trendlines display |
+| Heatmaps | Component×Priority heatmap, Account×Component heatmap, reporters, cross-cutting×component |
+| Components | Top 25 components, blocker/critical rate, top accounts, cross-cutting properties |
+| TF-IDF | Full-page keyword signature chart by component |
+| LDA Topics | Topic terms, topic prevalence, topic×component heatmap |
+| LPD Analysis | Top 30 referenced LPDs, LPD references by version, by priority, by fix priority |
+| LPD Spread & Co-occurrence | Bubble chart (version reach vs customer reach) + co-occurrence bar chart + heatmap |
+| LPD Drill-down | Filter by LPD, account, and version — all three compose freely; "All" option on each |
+| Notes | Analyst notes, methodology, recommendations — fill in via `tags$` HTML in the Rmd |
+
+---
+
+## Analytical methods
+
+### TF-IDF — "What makes this component's tickets unique?"
+
+Each component is treated as a document. TF-IDF scores words that appear
+frequently in one component's tickets but rarely in others. High-scoring terms
+are the component's signature vocabulary.
+
+**Important:** Bare numeric tokens (e.g. `70658`) that survive tokenization are
+ticket IDs — they are reformatted to `LPD-XXXXX` in the plot. These are valid
+signals: a ticket ID ranking high for a component means that LPD's fixes
+disproportionately appear in that component's conflict tickets.
+
+**Do not remove ticket IDs** — they are meaningful component-LPD associations.
+
+### LDA — "What natural problem clusters exist?"
+
+LDA reads all ticket summaries and finds groups of tickets that use similar
+language, without being told what to look for. Each topic is a cluster of
+co-occurring terms. Numbers are stripped before LDA runs (`removeNumbers`), so
+ticket IDs do not appear in LDA topics.
+
+**Identified topics (6):**
+- Topic 1: Patch & upgrade maintenance (patcher, upgrad, translat, baselin)
+- Topic 2: Security & localization conflicts (secur, languag, token, cve)
+- Topic 3: UI & site customization failures (page, conflict, picklist, templat, debug)
+- Topic 4: Patcher build & adaptation requests (patcher, fix, adapt, custom, build)
+- Topic 5: Web & content management rebases (field, web, form, miss, local, content)
+- Topic 6: LPE/portal display & catalog issues (lpe, display, catalog, valid, duplic)
+
+Topic 2 (security/CVE) is non-discretionary — cannot be managed down through
+process changes, requires dedicated resourcing.
+
+### LPD Co-occurrence — "Which fixes travel together?"
+
+Self-join of `lpd_refs` on `key`: every pair of LPDs that appear on the same
+fix ticket. High co-occurrence = coupled fixes that must be rebased together
+every time.
+
+**Key cluster:** LPD-64813, LPD-64812, LPD-64131 consistently appear together.
+Every customer who needs one typically needs all three — tripling the fix
+management work per customer.
+
+### LPD Spread Bubble Chart
+
+- **X axis:** unique affected versions that LPD was requested across
+- **Y axis:** unique account codes (customers) that filed fix tickets for it
+- **Bubble size:** total fix ticket count
+- **Color:** Fire/Critical severity (dark red = high severity)
+- **Lines:** ggrepel label arrows — not data relationships
+
+**Reading the quadrants:**
+- Top-right + dark red = highest systemic risk (wide version reach, wide customer reach, high severity)
+- Right + blue = missing backport (wide version reach, narrow customer reach — fix exists but was never comprehensively backported)
+- Bottom-left = normal noise
+
+---
+
+## Top findings
+
+**LPD-64813 / LPD-64812 / LPD-64131** — most referenced cluster, traveling
+together, 7 customers × 6 versions, Fire/Critical severity. Single highest
+priority for comprehensive backport.
+
+**Objects component** — structural conflict pattern driven by types of changes
+(field, relationship, localized) not individual bugs. Volume will regenerate
+after individual fixes. Requires architectural intervention, not bug-by-bug fix.
+
+**Core Infrastructure** — fix management work is security-driven (CVE, vulner).
+Non-discretionary. Requires dedicated capacity, not process reduction.
+
+**Performance** — driven by 5 identifiable LPDs. Most actionable component:
+backport those 5 and volume drops measurably.
+
+**Web Content** — driven by LPD-57453 and LPD-48888. Two bugs, high spread.
+
+**2025.Q1 version** — most conflict-prone release (4,831 version-level
+references). High patch tail (reaching .22) multiplies rebase surface.
+
+**Security Vulnerability cross-cutting tag** — ~998 ticket appearances.
+A significant portion of fix management volume is mandatory security remediation.
+
+---
+
+## Recommendations (summary)
+
+1. **Backport LPD-64813/64812/64131 as an atomic unit** across all active baselines immediately
+2. **Pre-flight conflict detection** in the hotfix patcher — prevent the ~52% of tickets that are build failures before they become tickets
+3. **Comprehensive backport policy** — any LPD appearing in 3+ fix tickets within 90 days of release triggers automatic backport review
+4. **Objects architectural review** — backward-compatibility testing before release, not reactive rebase after
+5. **Triage alignment** — if underlying LPD is Critical/Fire, fix management ticket inherits that priority
+6. **Investigate 2026 Q1 spike** — 1,208 tickets in one quarter warrants root cause analysis before next release cycle
+
+---
+
+## Technical setup
+
+### Running the analysis
+```r
+# Fresh run
+source("ad-hoc/FixManagementAnalysis.R")
+
+# Re-run from section 2 (skip Jira fetch)
+raw_issues <- readRDS("output/raw_issues_cache.rds")
+# then select from section 2 downward and run
+```
+
+### Running the dashboard locally
+```bash
+cd ~/dev/projects/liferay-release-analytics/ad-hoc
+Rscript -e "rmarkdown::run('FixManagementDashboard.Rmd')"
+```
+
+### Running via Docker
+```bash
+docker build -t fixmgmt-dashboard .
+docker run --rm -p 3838:3838 fixmgmt-dashboard
+# open http://localhost:3838
+```
+
+### Exporting to Looker Studio
+```r
+source("ad-hoc/export_fixmgmt.R")
+# uploads output/looker/fixmgmt/*.csv to Google Drive
+# AppScript picks up and updates sheets
+```
+
+---
+
+## Known issues & backlog
+
+- `p_lda_comp_hm` (topic × component heatmap) — requires re-running analysis to regenerate RData; old RData has `p_lda_priority_hm` which dashboard falls back to gracefully
+- Docker requires `ggrepel`, `tidytext`, `patchwork`, `purrr` in addition to base packages — all included in current Dockerfile
+- `setwd` in Rmd setup chunk must be wrapped in `dir.exists()` guard or `try()` to avoid Docker crash
+- LDA ticket ID removal (`removeNumbers`) strips IDs from topics but not TF-IDF — intentional, IDs are valid TF-IDF signals
+- 2026 Q1 spike (1,208 tickets) — root cause not yet determined; may be version support expansion, customer growth, or process change
+
+---
+
+## Interpreting screenshots
+
+When someone uploads a dashboard screenshot, use this reference to:
+
+1. **Identify the chart** from the panel title and visual type
+2. **Apply the correct methodology** (TF-IDF vs LDA vs co-occurrence vs spread)
+3. **Read the axes and encoding** using the definitions above
+4. **Give management-ready interpretation** — plain language, actionable, grounded in the project findings
+5. **Reference specific LPDs, components, or accounts** where visible
+
+For the bubble chart specifically: lines are ggrepel label arrows, not data.
+For TF-IDF: `LPD-XXXXX` bars are ticket IDs, not noise — interpret as component-LPD associations.
+For LDA: terms are stemmed (rebas = rebase, upgrad = upgrade, languag = language, secur = security).

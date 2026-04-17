@@ -109,7 +109,7 @@ run_triage.sh
   → store.py                    (upsert to fact_triage_results)
 ```
 
-Output files land in `output/` (gitignored):
+Output files land in `apps/triage/output/` (gitignored):
 - batch_N.md          raw classification responses per batch
 - triage_results.csv  flat export of classifications
 - git_diff_full.diff  full diff used for the run
