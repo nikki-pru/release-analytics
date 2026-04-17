@@ -9,7 +9,7 @@ Evaluates the risk of a local branch against a base branch (master) using five s
 Run from within the `liferay-portal` repository root:
 
 ```bash
-bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh <branch-name>
+bash /path/to/liferay-release-analytics/apps/scoring/evaluate_pr.sh <branch-name>
 ```
 
 By default, test execution and compilation are skipped for speed. Opt in explicitly:

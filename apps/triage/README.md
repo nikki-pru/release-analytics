@@ -207,3 +207,19 @@ app.properties, bnd.bnd, packageinfo, *.xml, *.properties, *.yml, *.yaml,
 
 - **`fact_triage_results` → `pr_outcomes`**: Each confirmed BUG row has
   testray_case_id + githash + likely_cause = labeled outcome for NN training.
+
+---
+
+## Claude Code workflow
+
+An interactive triage workflow runs alongside this batch pipeline. It uses the
+same building blocks (module matching, diff extraction, DB writes) but is
+driven by a Claude Code session rather than a single end-to-end shell script.
+
+- [`CLAUDE.md`](CLAUDE.md) — session instructions and conventions for the
+  Claude Code workflow.
+- [`tools/`](tools/) — thin tool wrappers callable from a Claude Code session
+  (e.g. DB queries, git helpers, module lookups).
+- [`traces/`](traces/) — per-run execution traces (gitignored).
+
+The batch pipeline described above is the production path and is unchanged.

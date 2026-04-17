@@ -29,7 +29,7 @@ output/
 # Dashboard rendered output
 # -----------------------------------------------------------------------------
 reports/situation_deck/release_situation_deck.html
-dashboard/
+/dashboard/
 
 # -----------------------------------------------------------------------------
 # R session artifacts
@@ -55,3 +55,10 @@ data/
 # Python environment
 # -----------------------------------------------------------------------------
 .venv/
+__pycache__/
+
+# -----------------------------------------------------------------------------
+# Triage runtime artifacts — per-run traces and batch output, not source
+# -----------------------------------------------------------------------------
+apps/triage/traces/
+apps/triage/output/

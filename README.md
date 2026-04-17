@@ -75,7 +75,7 @@ Five signals with composite weights:
 
 ```bash
 cd /path/to/liferay-portal
-bash /path/to/liferay-release-analytics/scoring/evaluate_pr.sh --branch your-branch-name
+bash /path/to/liferay-release-analytics/apps/scoring/evaluate_pr.sh --branch your-branch-name
 ```
 
 ---
@@ -191,9 +191,10 @@ liferay-release-analytics/
 │       ├── FixManagementAnalysis.R      # Fix Management conflict analysis (standalone)
 │       ├── FixManagementDashboard.Rmd   # Flexdashboard with Docker deployment
 │       └── exports/                     # Output CSVs for Looker Studio export
-├── scoring/                        # Branch risk scoring engine (standalone)
-│   ├── evaluate_pr.sh
-│   └── evaluate_pr.R
+├── apps/
+│   └── scoring/                    # Branch risk scoring engine (standalone)
+│       ├── evaluate_pr.sh
+│       └── evaluate_pr.R
 └── staging/                        # Intermediate pipeline files (gitignored)
 ```
 
