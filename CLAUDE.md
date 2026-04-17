@@ -10,7 +10,7 @@ signals from Jira, Testray, lizard, git, and feature flags into PostgreSQL
 dashboards surfacing insights to engineering teams and leadership.
 
 **Built and maintained by:** Release Quality Engineering
-**Primary owner:** Nikki
+**Primary owner:** Release Team
 
 ## Three use modes
 

@@ -222,11 +222,11 @@ psql -U postgres -d release_analytics -f db/migrations/migration_1.5.sql
 psql -U postgres -d release_analytics -f db/migrations/migration_1.6.sql
 ```
 
-**Don't want to run the full pipeline?** You can request a database snapshot from [@nikki-pru]. This gives you a pre-populated database you can query directly, run ad hoc analysis against, or use to render dashboards without re-running all extracts.
+**Don't want to run the full pipeline?** You can request a database snapshot from the Release Team. This gives you a pre-populated database you can query directly, run ad hoc analysis against, or use to render dashboards without re-running all extracts.
 
 ### Database snapshot (recommended for contributors)
 
-**Request:** Reach out to @nikki-pru to get the latest `release_analytics_YYYYMMDD.dump` file.
+**Request:** Reach out to the Release Team to get the latest `release_analytics_YYYYMMDD.dump` file.
 
 **Restore:**
 
@@ -404,4 +404,4 @@ Change `forecast_label` to any release in `dim_release` (e.g. `"U147"`, `"2025.Q
 Project conception, analytical direction, methodology, data-sourcing, and domain expertise are by the Liferay Release Team.
 Code generation and implementation is supported with Claude (Anthropic).
 
-For database access or questions about the platform reach out directly to @nikki-pru.
+For database access or questions about the platform reach out directly to the Release Team.

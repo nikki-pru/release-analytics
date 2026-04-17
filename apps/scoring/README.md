@@ -224,4 +224,4 @@ This risk scoring engine is a standalone component of the Release Analytics Plat
 Project conception, analytical direction, methodology, data-sourcing, and domain expertise are by the Liferay Release Team. 
 Code generation and implementation is supported with Claude (Anthropic).
 
-For database access or questions about the platform reach out directly to @nikki-pru
+For database access or questions about the platform reach out directly to the Release Team
