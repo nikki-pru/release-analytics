@@ -237,6 +237,60 @@ def find_diff_blocks(
     return matched
 
 
+# ---------------------------------------------------------------------------
+# Cross-component UI chrome detection
+#
+# Some UI regressions come from files outside the failing test's component —
+# classic case: a test in Frontend Taglib breaks because panel/page.jsp
+# (owned by Control Menu) dropped a CSS class. The test's component has
+# no matching hunk, so path-based find_diff_blocks gives up.
+#
+# This helper surfaces "shared UI chrome" files changed anywhere in the
+# diff — layout/navigation/taglib/theme files that many components depend
+# on. It doesn't classify; it gives the classifier extra evidence for
+# failures that look like cross-component UI regressions.
+# ---------------------------------------------------------------------------
+
+# Only match files that affect the DOM / styling at runtime — templates,
+# web resources, frontend sources. Java persistence / service impl files
+# don't belong here even if they live under a navigation/taglib path.
+_UI_CHROME_PATTERNS = [
+    r"/resources/.+\.(jsp|jspf|html)$",
+    r"/resources/.+/(nav|layout|header|panel|chrome|theme)/.+\.(jsp|tsx|ts|jsx|js|scss|css)$",
+    r"/application-list-taglib/.+/resources/.+",
+    r"/frontend-taglib/.+/resources/.+",
+    r"/frontend-taglib-clay/.+/resources/.+",
+    r"/frontend-js-web/.+/resources/.+\.(tsx|ts|jsx|js)$",
+    r"/product-navigation/.+/resources/.+\.(tsx|ts|jsx|js|jsp|scss|css)$",
+    r"/site-navigation/.+/resources/.+\.(tsx|ts|jsx|js|jsp|scss|css)$",
+    r"/nav-menu/.+/resources/.+",
+    r"/theme/.+\.(jsp|scss|css|js|tsx)$",
+    r"/layout-admin-web/.+/resources/.+\.(jsp|tsx|scss|css)$",
+]
+
+# Files bigger than this are almost always generated / mass-refactored
+# noise (service persistence, legacy sample files). Trim.
+_UI_CHROME_MAX_LINES = 600
+
+
+def find_ui_chrome_changes(diff_blocks: dict[str, str]) -> list[tuple[str, int]]:
+    """Return [(path, changed_line_count)] for diff files matching shared-UI
+    paths (templates, web resources, frontend sources). Sorted descending
+    by change size; files over _UI_CHROME_MAX_LINES are dropped as almost
+    certainly noise."""
+    matches = []
+    for path, block in diff_blocks.items():
+        if not any(re.search(p, path) for p in _UI_CHROME_PATTERNS):
+            continue
+        lines = block.splitlines()
+        added   = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+        changed = added + removed
+        if 0 < changed <= _UI_CHROME_MAX_LINES:
+            matches.append((path, changed))
+    return sorted(matches, key=lambda x: -x[1])
+
+
 def shorten_test_name(name: str) -> str:
     """Shorten long Java/Playwright test names for prompt readability."""
     if "LocalFile." in name:

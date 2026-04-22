@@ -599,11 +599,11 @@ python3 apps/triage/submit.py runs/{run_dir_name}
 
 Add `--no-upsert` to inspect the validated summary without writing to `fact_triage_results`.
 
----
-
-## Failures to classify
-
 """
+
+# Emitted after PROMPT_HEADER (and after the optional "UI chrome changes"
+# section), immediately before the per-failure blocks.
+_FAILURES_HEADER = "\n---\n\n## Failures to classify\n\n"
 
 
 def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
@@ -617,6 +617,37 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
     except FileNotFoundError:
         diff_blocks = {}
 
+    # Surface shared-UI-chrome files changed anywhere in the diff. Useful
+    # evidence for cross-component failures where the failing test's
+    # component has no matching hunk but a shared layout/nav/taglib file
+    # was touched.
+    chrome_changes = prompt_helpers.find_ui_chrome_changes(diff_blocks)
+
+    chrome_lines: list[str] = []
+    if chrome_changes:
+        chrome_lines.append("## UI chrome changes")
+        chrome_lines.append("")
+        chrome_lines.append(
+            "Files changed in shared layout / navigation / taglib / theme "
+            "paths — these can break UI tests in *other* components (the "
+            "failing test's component won't show a matching hunk). Cross-"
+            "reference against per-failure sections below when the error "
+            "is UI-shaped (strict mode violation, element-not-found, "
+            "visibility timeout, getByText not found)."
+        )
+        chrome_lines.append("")
+        chrome_lines.append(f"_{len(chrome_changes)} shared-UI files changed. "
+                            f"Sorted by change size, smallest last._")
+        chrome_lines.append("")
+        chrome_lines.append("| Changed lines | File |")
+        chrome_lines.append("|---:|---|")
+        for path, n in chrome_changes:
+            chrome_lines.append(f"| {n} | `{path}` |")
+        chrome_lines.append("")
+        chrome_lines.append("---")
+        chrome_lines.append("")
+
+    has_chrome = bool(chrome_changes)
     body_lines: list[str] = []
     for i, (_, row) in enumerate(df_to_classify.iterrows(), start=1):
         short = prompt_helpers.shorten_test_name(str(row.get("test_case") or ""))
@@ -652,11 +683,22 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
                 body_lines.append("```")
                 body_lines.append("")
         else:
-            body_lines.append(
-                "_No diff hunk matched by path heuristics. Likely FALSE_POSITIVE "
-                "unless error directly names a component that changed; scan "
-                "`git_diff_full.diff` before deciding._"
-            )
+            if has_chrome:
+                body_lines.append(
+                    "_No direct hunk match by path. If the error is UI-shaped "
+                    "(strict mode violation, element-not-found, visibility "
+                    "timeout), cross-check the **UI chrome changes** section "
+                    "at the top — a shared layout or navigation file may be "
+                    "the real culprit even though it's in a different "
+                    "component. Consult `git_diff_full.diff` to confirm._"
+                )
+            else:
+                body_lines.append(
+                    "_No diff hunk matched by path heuristics, and no shared-"
+                    "UI-chrome files changed either. Likely FALSE_POSITIVE "
+                    "unless the error specifically names a file also in the "
+                    "diff; scan `git_diff_full.diff` before deciding._"
+                )
             body_lines.append("")
 
         body_lines.append("---")
@@ -677,7 +719,12 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
         run_dir_name=run_dir.name,
     )
 
-    (run_dir / "prompt.md").write_text(header + "\n".join(body_lines), encoding="utf-8")
+    parts = [header]
+    if chrome_lines:
+        parts.append("\n".join(chrome_lines))
+    parts.append(_FAILURES_HEADER)
+    parts.append("\n".join(body_lines))
+    (run_dir / "prompt.md").write_text("".join(parts), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
