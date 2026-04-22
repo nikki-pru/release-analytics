@@ -84,19 +84,25 @@ If there's no dump, ask the user to download the latest
 `testray_analytical_YYYY-MM-DD.dump` from the shared Drive and put it in
 this folder. Then restart.
 
-## Step 3 — Clone the release-analytics repo
+## Step 3 — Clone (or update) the release-analytics repo
 
 Put it alongside this working folder (not inside it). Default parent is
 the parent of the current folder:
 
 ```bash
+# If the clone doesn't exist yet:
 git clone git@github.com:liferay-release/release-analytics.git
+# SSH not set up? Use HTTPS instead:
+# git clone https://github.com/liferay-release/release-analytics.git
 ```
 
-If SSH isn't set up, fall back to HTTPS:
+If the clone **already exists** (re-running setup, previous attempt,
+etc.), pull the latest so you pick up any post-share fixes to the
+compose file, restore script, or prepare.py:
 
 ```bash
-git clone https://github.com/liferay-release/release-analytics.git
+cd release-analytics
+git pull --ff-only origin master
 ```
 
 From here on, run commands from **inside the cloned repo** unless noted.
