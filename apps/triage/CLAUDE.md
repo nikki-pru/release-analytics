@@ -11,8 +11,16 @@ full rubric, schema, and file contracts.
 
 ## Session shape — prepare → classify → submit
 
+Two input modes (API mode planned):
+
 ```
+# Both builds in testray_analytical
 python3 -m apps.triage.prepare from-db --build-a <A> --build-b <B>
+
+# Baseline in DB; target from a Testray CSV export (for fresh builds not yet ingested)
+python3 -m apps.triage.prepare from-csv \
+    --baseline-build <A> --target-csv path/to/case_results.csv \
+    --target-build-id <B> --target-hash <sha>
       ↓
 runs/r_<ts>_<A>_<B>/
    ├── run.yml              (metadata: builds, hashes, routine, classifier)

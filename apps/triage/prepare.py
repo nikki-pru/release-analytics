@@ -88,51 +88,176 @@ def _strip_sql_comments(sql: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: test_diff from testray_analytical
+# Step 1: test_diff — three input paths, one output shape
+# ---------------------------------------------------------------------------
+#
+# The downstream pipeline (git diff → hunks → prompt) needs a DataFrame with
+# these columns:
+#
+#   testray_case_id, test_case, known_flaky, testray_component_name,
+#   status_a, status_b, error_message, linked_issues
+#
+# We produce that shape from three possible sources for the target side:
+#   - from-db  (both baseline and target from testray_analytical)
+#   - from-csv (baseline from DB, target from a Testray CSV export)
+#   - from-api (baseline from DB, target from Testray REST) — future
 # ---------------------------------------------------------------------------
 
-def run_test_diff(build_a: int, build_b: int, db_cfg: dict) -> pd.DataFrame:
-    sql_raw = (TRIAGE_DIR / "test_diff.sql").read_text()
-    sql = _strip_sql_comments(sql_raw)
-    sql = sql.replace("%(build_id_a)s", str(build_a)) \
-             .replace("%(build_id_b)s", str(build_b))
+# Worst-status-wins order for de-duping retry rows in a Testray CSV export.
+_STATUS_RANK = {"FAILED": 4, "BLOCKED": 3, "UNTESTED": 2, "PASSED": 1}
 
+
+def fetch_build_caseresults(build_id: int, db_cfg: dict) -> pd.DataFrame:
+    """All case results for a single build from testray_analytical — returns
+    raw rows (one per run × case). Aggregation happens inside
+    compute_test_diff so baseline and target can use different semantics.
+    """
+    sql = """
+        SELECT case_id, case_name, case_flaky, component_name, team_name,
+               status, errors, jira_issue
+        FROM caseresult_analytical
+        WHERE build_id = %s
+    """
     with _connect(db_cfg) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    return pd.DataFrame(rows)
+            cur.execute(sql, (build_id,))
+            return pd.DataFrame(cur.fetchall())
+
+
+def parse_testray_csv(path: Path) -> pd.DataFrame:
+    """Parse a Testray CSV export (one build's results) into a DataFrame with
+    the same column names as fetch_build_caseresults. `case_id` is blank —
+    it's filled later by matching to the baseline DataFrame on
+    (case_name, component). Returns raw rows (one per run)."""
+    raw = pd.read_csv(path)
+    required = {"Case Name", "Component", "Status"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise SystemExit(f"Testray CSV at {path} is missing columns: {missing}")
+
+    return pd.DataFrame({
+        "case_id":        [None] * len(raw),
+        "case_name":      raw["Case Name"].astype(str),
+        "case_flaky":     [None] * len(raw),    # filled from baseline on match
+        "component_name": raw["Component"].astype(str),
+        "team_name":      raw.get("Team",    pd.Series([None] * len(raw))),
+        "status":         raw["Status"].astype(str),
+        "errors":         raw.get("Errors",  pd.Series([None] * len(raw))),
+        "jira_issue":     raw.get("Issues",  pd.Series([None] * len(raw))),
+    })
+
+
+def _aggregate_baseline(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    """For each key, status='PASSED' if any retry passed — otherwise worst
+    status wins. Matches the semantics of test_diff.sql's PASSED filter,
+    where any passing run is enough to count the case as "passing" in A."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["_is_pass"] = (df["status"] == "PASSED").astype(int)
+    df["_rank"]    = df["status"].map(_STATUS_RANK).fillna(0).astype(int)
+    # Prefer passing rows; fall back to worst-status row.
+    df = df.sort_values(["_is_pass", "_rank"], ascending=[False, False])
+    out = df.drop_duplicates(subset=key_cols, keep="first") \
+            .drop(columns=["_is_pass", "_rank"]) \
+            .reset_index(drop=True)
+    return out
+
+
+def _aggregate_target(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    """For each key, keep the worst-status row — any failed retry should
+    surface (and bring its error_message / linked issues with it)."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["_rank"] = df["status"].map(_STATUS_RANK).fillna(0).astype(int)
+    out = df.sort_values("_rank", ascending=False) \
+            .drop_duplicates(subset=key_cols, keep="first") \
+            .drop(columns="_rank") \
+            .reset_index(drop=True)
+    return out
+
+
+def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFrame:
+    """Inner-join baseline (A) and target (B) and keep cases that PASSED in A
+    and FAILED/BLOCKED/UNTESTED in B.
+
+    Join key:
+      - Both sides have non-null case_id → join on case_id (DB × DB, DB × API).
+      - Target lacks case_id (Testray CSV) → join on (case_name, component).
+        Baseline's case_id is inherited on match; unmatched target rows are
+        dropped (no persistable key).
+    """
+    if baseline.empty or target.empty:
+        return pd.DataFrame()
+
+    target_has_ids = target["case_id"].notna().any()
+    key_cols = ["case_id"] if target_has_ids else ["case_name", "component_name"]
+
+    b = _aggregate_baseline(baseline, key_cols=key_cols)
+    t = _aggregate_target(target,     key_cols=key_cols)
+
+    merged = b.merge(t, on=key_cols, how="inner", suffixes=("_a", "_b"))
+    diff = merged[
+        (merged["status_a"] == "PASSED")
+        & merged["status_b"].isin(["FAILED", "BLOCKED", "UNTESTED"])
+    ].copy()
+
+    # After merge, the join keys stay un-suffixed; other shared columns get
+    # _a / _b suffixes. Pick the baseline side for identity metadata.
+    case_id_col = "case_id"          if target_has_ids     else "case_id_a"
+    name_col    = "case_name_a"      if target_has_ids     else "case_name"
+    comp_col    = "component_name_a" if target_has_ids     else "component_name"
+    flaky_col   = "case_flaky_a"   # case_flaky is always a shared non-join column
+
+    out = pd.DataFrame({
+        "testray_case_id":        diff[case_id_col],
+        "test_case":              diff[name_col],
+        "known_flaky":            diff[flaky_col].fillna(False),
+        "testray_component_name": diff[comp_col],
+        "status_a":               diff["status_a"],
+        "status_b":               diff["status_b"],
+        "error_message":          diff["errors_b"],
+        "linked_issues":          diff["jira_issue_b"],
+    })
+    out = out.dropna(subset=["testray_case_id"]).reset_index(drop=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Step 2: git_hash + routine lookup from dim_build
 # ---------------------------------------------------------------------------
 
-def resolve_build_metadata(build_a: int, build_b: int, db_cfg: dict) -> dict:
-    sql_raw = (TRIAGE_DIR / "git_hash_lookup.sql").read_text()
-    sql = _strip_sql_comments(sql_raw)
-    sql = sql.replace("%(build_id_a)s", str(build_a)) \
-             .replace("%(build_id_b)s", str(build_b))
-
+def fetch_build_metadata(build_id: int, db_cfg: dict) -> dict | None:
+    """Fetch git_hash / routine_id / build_name for a single build from
+    dim_build. Returns None if not found."""
+    sql = """
+        SELECT build_id, build_name, git_hash, routine_id
+        FROM dim_build
+        WHERE build_id = %s
+    """
     with _connect(db_cfg) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql)
-            rows = {r["build_id"]: r for r in cur.fetchall()}
+            cur.execute(sql, (build_id,))
+            row = cur.fetchone()
+    return dict(row) if row else None
 
-    if build_a not in rows or build_b not in rows:
-        missing = [b for b in (build_a, build_b) if b not in rows]
+
+def resolve_build_metadata(build_a: int, build_b: int, db_cfg: dict) -> dict:
+    ra = fetch_build_metadata(build_a, db_cfg)
+    rb = fetch_build_metadata(build_b, db_cfg)
+    missing = [b for b, r in ((build_a, ra), (build_b, rb)) if r is None]
+    if missing:
         raise SystemExit(f"Build(s) not in dim_build: {missing}")
-
-    ra, rb = rows[build_a], rows[build_b]
     if ra["routine_id"] != rb["routine_id"]:
         print(f"WARNING: builds are on different routines "
               f"(A={ra['routine_id']}, B={rb['routine_id']}). "
               f"Diff may still be meaningful but test_diff will miss cases "
               f"that don't run on both.", file=sys.stderr)
     return {
-        "hash_a":     ra["git_hash"],
-        "hash_b":     rb["git_hash"],
-        "routine_id": ra["routine_id"],
+        "hash_a":       ra["git_hash"],
+        "hash_b":       rb["git_hash"],
+        "routine_id":   ra["routine_id"],
         "build_a_name": ra["build_name"],
         "build_b_name": rb["build_name"],
     }
@@ -464,31 +589,18 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
 # Orchestrator — from-db mode
 # ---------------------------------------------------------------------------
 
-def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
-    cfg        = load_config()
-    testray    = cfg["databases"]["testray"]
-    git_repo   = Path(cfg["git"]["repo_path"]).expanduser()
-
-    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_id  = f"r_{ts}_{build_a}_{build_b}"
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"→ Step 1/6 test_diff …")
-    df = run_test_diff(build_a, build_b, testray)
-    if df.empty:
-        raise SystemExit("test_diff returned 0 rows.")
-    print(f"   {len(df)} rows (before dedup) — status_b: "
-          f"{df['status_b'].value_counts().to_dict()}")
-
-    print(f"→ Step 2/6 build metadata …")
-    meta = resolve_build_metadata(build_a, build_b, testray)
-    print(f"   routine_id={meta['routine_id']}  "
-          f"A={meta['hash_a'][:12]}  B={meta['hash_b'][:12]}")
-
+def _finalize_bundle(
+    df: pd.DataFrame, run_id: str, run_dir: Path,
+    classifier: str, input_mode: str,
+    build_a: int, build_b: int, hash_a: str, hash_b: str,
+    routine_id: int, build_a_name: str, build_b_name: str,
+    git_repo: Path,
+) -> Path:
+    """Shared steps 3-6: git diff → hunks → enrich → prompt + schema + run.yml.
+    `df` is the compute_test_diff output (pre-dedup)."""
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
-    diff_lines = run_git_diff(git_repo, meta["hash_a"], meta["hash_b"], diff_path)
+    diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path)
     print(f"   {diff_lines} lines → {diff_path.relative_to(PROJECT_ROOT)}")
 
     print(f"→ Step 4/6 fragments + filtered hunks …")
@@ -501,9 +613,8 @@ def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
 
     print(f"→ Step 5/6 enrich + pre-classify …")
     df = enrich_and_pre_classify(df)
-    # Dedup — SQL can return duplicates when a case has multiple result rows per build
     df = df.drop_duplicates(subset="testray_case_id", keep="first").reset_index(drop=True)
-    df_flaky = df[df["known_flaky"].fillna(False)].copy()
+    df_flaky    = df[df["known_flaky"].fillna(False)].copy()
     df_nonflaky = df[~df["known_flaky"].fillna(False)].copy()
     df_auto     = df_nonflaky[df_nonflaky["pre_classification"].notna()].copy()
     df_to_cls   = df_nonflaky[df_nonflaky["pre_classification"].isna()].copy()
@@ -524,19 +635,19 @@ def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
         run_dir,
         run_id=run_id, classifier=classifier,
         build_a=build_a, build_b=build_b,
-        hash_a=meta["hash_a"], hash_b=meta["hash_b"],
-        routine_id=meta["routine_id"],
-        build_a_name=meta["build_a_name"], build_b_name=meta["build_b_name"],
+        hash_a=hash_a, hash_b=hash_b,
+        routine_id=routine_id,
+        build_a_name=build_a_name, build_b_name=build_b_name,
         df_to_classify=df_to_cls, df_auto=df_auto, df_flaky=df_flaky,
         hunks_path=hunks_path,
     )
     write_run_yml(
         run_dir,
-        run_id=run_id, input_mode="from-db", classifier=classifier,
+        run_id=run_id, input_mode=input_mode, classifier=classifier,
         build_a=build_a, build_b=build_b,
-        hash_a=meta["hash_a"], hash_b=meta["hash_b"],
-        routine_id=meta["routine_id"],
-        build_a_name=meta["build_a_name"], build_b_name=meta["build_b_name"],
+        hash_a=hash_a, hash_b=hash_b,
+        routine_id=routine_id,
+        build_a_name=build_a_name, build_b_name=build_b_name,
         total_failures=len(df),
         auto_classified=len(df_auto),
         flaky_excluded=len(df_flaky),
@@ -547,6 +658,127 @@ def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
     print(f"Next: open {rel}/prompt.md in your Claude Code session and classify.")
     print(f"Then: python3 apps/triage/submit.py {rel}")
     return run_dir
+
+
+def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
+    cfg      = load_config()
+    testray  = cfg["databases"]["testray"]
+    git_repo = Path(cfg["git"]["repo_path"]).expanduser()
+
+    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id  = f"r_{ts}_{build_a}_{build_b}"
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"→ Step 1/6 test_diff (DB × DB) …")
+    baseline = fetch_build_caseresults(build_a, testray)
+    target   = fetch_build_caseresults(build_b, testray)
+    if baseline.empty or target.empty:
+        raise SystemExit(f"No case results for build_a={build_a} or build_b={build_b}.")
+    df = compute_test_diff(baseline, target)
+    if df.empty:
+        raise SystemExit("test_diff returned 0 rows.")
+    print(f"   {len(df)} regressions — status_b: "
+          f"{df['status_b'].value_counts().to_dict()}")
+
+    print(f"→ Step 2/6 build metadata …")
+    meta = resolve_build_metadata(build_a, build_b, testray)
+    print(f"   routine_id={meta['routine_id']}  "
+          f"A={meta['hash_a'][:12]}  B={meta['hash_b'][:12]}")
+
+    return _finalize_bundle(
+        df=df, run_id=run_id, run_dir=run_dir,
+        classifier=classifier, input_mode="from-db",
+        build_a=build_a, build_b=build_b,
+        hash_a=meta["hash_a"], hash_b=meta["hash_b"],
+        routine_id=meta["routine_id"],
+        build_a_name=meta["build_a_name"], build_b_name=meta["build_b_name"],
+        git_repo=git_repo,
+    )
+
+
+def prepare_from_csv(
+    baseline_build: int,
+    target_csv: Path,
+    target_build_id: int,
+    target_hash: str,
+    classifier: str,
+    target_name: str | None = None,
+) -> Path:
+    """Baseline from DB, target from a Testray CSV export.
+
+    Dev supplies target_build_id + target_hash because the CSV doesn't carry
+    them. If the target build happens to also be in dim_build, metadata fills
+    in automatically; otherwise the dev's values are authoritative.
+    """
+    cfg      = load_config()
+    testray  = cfg["databases"]["testray"]
+    git_repo = Path(cfg["git"]["repo_path"]).expanduser()
+
+    target_csv = target_csv.expanduser().resolve()
+    if not target_csv.exists():
+        raise SystemExit(f"Target CSV not found: {target_csv}")
+
+    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id  = f"r_{ts}_{baseline_build}_{target_build_id}"
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"→ Step 1/6 test_diff (DB × CSV) …")
+    baseline = fetch_build_caseresults(baseline_build, testray)
+    if baseline.empty:
+        raise SystemExit(f"No case results in DB for baseline build {baseline_build}.")
+    target = parse_testray_csv(target_csv)
+    if target.empty:
+        raise SystemExit(f"Target CSV is empty: {target_csv}")
+
+    # Sanity diagnostic: how many target rows will actually match the baseline?
+    matched = target.merge(
+        baseline[["case_name", "component_name"]],
+        on=["case_name", "component_name"], how="inner",
+    )
+    print(f"   baseline rows: {len(baseline)}")
+    print(f"   target rows:   {len(target)}  (matched to baseline: {len(matched)})")
+    unmatched = len(target) - len(matched)
+    if unmatched > 0:
+        print(f"   unmatched:     {unmatched} (target-only — no case_id, cannot persist)")
+
+    df = compute_test_diff(baseline, target)
+    if df.empty:
+        raise SystemExit("test_diff returned 0 rows (no PASSED→FAILED after matching).")
+    print(f"   {len(df)} regressions — status_b: "
+          f"{df['status_b'].value_counts().to_dict()}")
+
+    print(f"→ Step 2/6 build metadata …")
+    ra = fetch_build_metadata(baseline_build, testray)
+    if ra is None:
+        raise SystemExit(f"Baseline build {baseline_build} not in dim_build.")
+    # Target: try DB first, fall back to dev-supplied values.
+    rb = fetch_build_metadata(target_build_id, testray)
+    target_final = {
+        "build_id":   target_build_id,
+        "build_name": (rb or {}).get("build_name") or target_name or f"csv:{target_csv.name}",
+        "git_hash":   (rb or {}).get("git_hash")   or target_hash,
+        "routine_id": (rb or {}).get("routine_id") or ra["routine_id"],
+    }
+    if rb and rb["git_hash"] and rb["git_hash"] != target_hash:
+        print(f"WARNING: --target-hash={target_hash[:12]} differs from dim_build "
+              f"git_hash={rb['git_hash'][:12]}. Using --target-hash.",
+              file=sys.stderr)
+        target_final["git_hash"] = target_hash
+    print(f"   routine_id={target_final['routine_id']}  "
+          f"A={ra['git_hash'][:12]}  B={target_final['git_hash'][:12]}")
+
+    return _finalize_bundle(
+        df=df, run_id=run_id, run_dir=run_dir,
+        classifier=classifier, input_mode="from-csv",
+        build_a=baseline_build, build_b=target_build_id,
+        hash_a=ra["git_hash"], hash_b=target_final["git_hash"],
+        routine_id=target_final["routine_id"],
+        build_a_name=ra["build_name"],
+        build_b_name=target_final["build_name"],
+        git_repo=git_repo,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -560,16 +792,39 @@ def main() -> None:
     sub = ap.add_subparsers(dest="mode", required=True)
 
     db = sub.add_parser("from-db",
-        help="Read PASSED→FAILED cases from testray_analytical for a given build pair.")
+        help="Both builds from testray_analytical.")
     db.add_argument("--build-a", type=int, required=True, help="Baseline build id")
     db.add_argument("--build-b", type=int, required=True, help="Target build id")
     db.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
-                    help=f"Provenance label written to fact_triage_results "
-                         f"(default: {DEFAULT_CLASSIFIER})")
+                    help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
+
+    cv = sub.add_parser("from-csv",
+        help="Baseline from testray_analytical, target from a Testray CSV export.")
+    cv.add_argument("--baseline-build",  type=int, required=True,
+                    help="Baseline build id (must be in testray_analytical)")
+    cv.add_argument("--target-csv",      type=Path, required=True,
+                    help="Path to Testray CSV export for the target build")
+    cv.add_argument("--target-build-id", type=int, required=True,
+                    help="Build id for the target (written to fact_triage_results)")
+    cv.add_argument("--target-hash",     required=True,
+                    help="Git hash for the target build")
+    cv.add_argument("--target-name",     default=None,
+                    help="Optional display name for the target build")
+    cv.add_argument("--classifier",      default=DEFAULT_CLASSIFIER,
+                    help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
 
     args = ap.parse_args()
     if args.mode == "from-db":
         prepare_from_db(args.build_a, args.build_b, args.classifier)
+    elif args.mode == "from-csv":
+        prepare_from_csv(
+            baseline_build=args.baseline_build,
+            target_csv=args.target_csv,
+            target_build_id=args.target_build_id,
+            target_hash=args.target_hash,
+            classifier=args.classifier,
+            target_name=args.target_name,
+        )
     else:
         raise SystemExit(f"Unknown mode: {args.mode}")
 

@@ -137,23 +137,52 @@ psql -U postgres -h localhost -d testray_analytical -c \
 
 ## Usage
 
+Two input modes (API mode is planned — see Backlog):
+
+### `from-db` — both builds in `testray_analytical`
+
+Used when you've already ingested both builds into the local DB.
+
 ```bash
-# 1. Prepare the run bundle
 python3 -m apps.triage.prepare from-db \
     --build-a 451312408 \
     --build-b 462975400
+```
 
-# → apps/triage/runs/r_<ts>_451312408_462975400/  (bundle written)
+### `from-csv` — baseline in DB, target from a Testray CSV export
 
-# 2. Classify inside your own Claude Code session
-#    Open the bundle's prompt.md, read the failures, write results.json
-#    in the same directory against results.schema.json.
+Used when the target build is newer than your last `testray_analytical`
+refresh. Download the target build's case results from Testray as a CSV,
+then:
+
+```bash
+python3 -m apps.triage.prepare from-csv \
+    --baseline-build 451312408 \
+    --target-csv ~/Downloads/case_results.csv \
+    --target-build-id 462975400 \
+    --target-hash 77445e4a3a4725acd868027493b96ef41d6afbe8
+```
+
+The CSV has no `case_id`, so matching to the baseline happens on
+`(Case Name, Component)`. Baseline's `case_id` and `case_flaky` are
+inherited on match; unmatched target rows are dropped (they can't be
+persisted to `fact_triage_results`).
+
+Dev supplies `--target-build-id` and `--target-hash` manually because the
+Testray export doesn't include them. If the target build is also in
+`dim_build`, its metadata fills in automatically.
+
+### Classify + submit (same for both modes)
+
+```bash
+# 2. Classify inside your own Claude Code session:
+#    open runs/r_<id>/prompt.md, write runs/r_<id>/results.json
 
 # 3. Submit
-python3 -m apps.triage.submit apps/triage/runs/r_<ts>_451312408_462975400
+python3 -m apps.triage.submit apps/triage/runs/r_<id>
 
-# Or inspect without writing to DB
-python3 -m apps.triage.submit apps/triage/runs/r_<ts>_451312408_462975400 --no-upsert
+# Or validate + print summary without writing to DB
+python3 -m apps.triage.submit apps/triage/runs/r_<id> --no-upsert
 ```
 
 `prepare.py` also takes `--classifier <label>` to override the default
@@ -236,13 +265,12 @@ app.properties, bnd.bnd, packageinfo, *.xml, *.properties, *.yml, *.yaml,
 
 ## Backlog
 
-- **CSV and API input modes** (`prepare.py from-csv`, `from-api`). Notable
-  CSV gotcha: the Testray CSV export has `Case Name`, `Component`, `Team`,
-  and a `Case Result URL` containing a `case_result_id`, but no
-  `case_id`, `build_id`, `git_hash`, or `module_path`. Matching rule
-  between target-CSV rows and baseline-DB rows needs to be formalized
-  (likely `(Case Name, Component)` when `case_result_id` lookup is not
-  possible).
+- **`prepare.py from-api`** — fetch target directly from Testray REST
+  (OAuth2 client_credentials) so devs don't have to download a CSV first.
+  Same downstream shape as `from-csv`. Needs: endpoint spec
+  (`/o/c/caseresults` with `filter=r_buildToCaseResult_c_buildId eq 'X'`),
+  pagination, and OAuth token refresh in Python (the R pipeline already
+  does this in `extract/extract_testray.R` for reference).
 - **Jira ticket auto-creation** (`create_jira_tickets.py`): Read
   `fact_triage_results` for a build, filter to BUG + NEEDS_REVIEW where
   `linked_issues` is null, create LPD tickets via Jira REST, write

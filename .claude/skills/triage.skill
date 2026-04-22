@@ -44,9 +44,9 @@ apps/triage/submit.py   →  validates results.json against schema,
 ```
 
 Input modes (from `prepare.py`):
-- `from-db` (implemented) — PASSED→FAILED from `caseresult_analytical`
-- `from-csv` (planned — step 2) — one build's results exported from Testray
-- `from-api` (planned — step 2) — direct fetch via Testray REST
+- `from-db` (implemented) — both builds from `caseresult_analytical`; joins on `case_id`.
+- `from-csv` (implemented) — baseline from DB, target from a Testray CSV export; joins on `(Case Name, Component)` since the CSV has no `case_id`. Dev supplies `--target-build-id` and `--target-hash` manually.
+- `from-api` (planned) — baseline from DB, target fetched live from Testray REST. OAuth2 client_credentials, same downstream shape as `from-csv`.
 
 ## Classification rubric
 
