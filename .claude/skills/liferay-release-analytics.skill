@@ -54,6 +54,29 @@ feature flags            ──► apply_feature_flag_dampening.R
 liferay-portal checkout ──► evaluate_pr.sh ──► branch risk score (standalone)
 ```
 
+### The four-layer model — where accountability lives
+
+A framework for evaluating any proposal to replace tooling with AI.
+
+| Layer | Owner | Examples |
+|---|---|---|
+| Data (root) | Testray, CI, git, Jira | Test results, triage labels, churn, defects |
+| Logic | Code / deterministic tools | Hotfix packaging, CI execution, pipeline transforms |
+| Analysis & reasoning | AI / RAP | Risk scoring, flakiness detection, trend analysis |
+| Judgment | Human | Triage decisions, release calls, hotfix scope |
+
+Each layer has a distinct job. The temptation — especially as AI becomes more capable — is to collapse all four into a prompt. AI *feels* like it can handle data retrieval, logic execution, analysis, and judgment simultaneously. The problem is that "feels capable" and "is accountable" are different things.
+
+When layers get collapsed:
+- **Data gets skipped** — AI reasons from training data instead of your actual test history
+- **Logic gets approximated** — AI describes what a hotfix should do instead of building what it needs to be
+- **Analysis loses grounding** — conclusions aren't traceable back to source data
+- **Judgment disappears** — decisions get made without anyone owning them
+
+Collapsing the layers doesn't remove accountability. It just makes it invisible until something breaks.
+
+**The loop:** Human judgment → triage labels → training data → better AI reasoning → sharper signals for the next human decision. The layers feed each other; none replaces another.
+
 ### Key tables
 
 | Table | Grain | Key fields |
