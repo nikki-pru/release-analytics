@@ -21,16 +21,15 @@ old batch pipeline are retired.
 ## How it works
 
 ```
-prepare.py from-db  →  runs/r_<id>/prompt.md + diff_list.csv + hunks.txt
-                                 + git_diff_full.diff + results.schema.json
-                                 + run.yml
+prepare.py  →  runs/r_<id>/prompt.md + diff_list.csv + hunks.txt
+                 + git_diff_full.diff + results.schema.json + run.yml
                           ↓
             [Dev's Claude Code session reads prompt.md, classifies,
              writes results.json — no API call from this repo]
                           ↓
-submit.py           →  validates results.json against the schema,
-                          upserts into fact_triage_results + triage_run_log
-                          (or --no-upsert for inspection / laptop-only devs)
+submit.py   →  validates results.json against the schema,
+                 upserts into fact_triage_results + triage_run_log
+                 (or --no-upsert for inspection / laptop-only devs)
 ```
 
 Inside `prepare.py`:
@@ -59,7 +58,7 @@ auto-classified + flaky rows, and upserts under the classifier label from
 
 | File | Purpose |
 |---|---|
-| `prepare.py` | **Entry point 1** — build the run bundle (`from-db` mode; `from-csv`/`from-api` are step 2) |
+| `prepare.py` | **Entry point 1** — build the run bundle. Baseline and target each pick a source: `db`, `csv`, or `api`. |
 | `submit.py` | **Entry point 2** — validate `results.json`, upsert into DB, or `--no-upsert` |
 | `prompt_helpers.py` | Pre-classification patterns, diff parsing, test→hunk matching, name shortening |
 | `db.py` | DB connections — release_analytics + testray_analytical |
@@ -137,65 +136,72 @@ psql -U postgres -h localhost -d testray_analytical -c \
 
 ## Usage
 
-Three input modes:
-
-### `from-db` — both builds in `testray_analytical`
-
-Used when you've already ingested both builds into the local DB.
+Each side (baseline, target) independently selects a source: `db`
+(`testray_analytical`), `csv` (Testray CSV export), or `api` (Testray
+REST, OAuth2 client_credentials).
 
 ```bash
-python3 -m apps.triage.prepare from-db \
-    --build-a 451312408 \
-    --build-b 462975400
+python3 -m apps.triage.prepare \
+    --baseline-source {db,csv,api} --baseline-build-id <A> \
+        [--baseline-csv  <path>]  [--baseline-hash <sha>] [--baseline-name <str>] \
+    --target-source   {db,csv,api} --target-build-id   <B> \
+        [--target-csv    <path>]  [--target-hash   <sha>] [--target-name   <str>]
 ```
 
-### `from-csv` — baseline in DB, target from a Testray CSV export
+**Per-source arg rules:**
 
-Used when the target build is newer than your last `testray_analytical`
-refresh. Download the target build's case results from Testray as a CSV,
-then:
+| Source | Extra args | Notes |
+|---|---|---|
+| `db` | none | Build metadata from `dim_build`. Fails if the build isn't in the local DB. |
+| `csv` | `--{side}-csv`, `--{side}-hash` | Exports carry `(Case Name, Component)` but no `case_id` or git sha — you must pass `--{side}-hash` manually. `--{side}-name` is optional. |
+| `api` | nothing required | `--{side}-hash` is optional (falls back to `dim_build`; required if the build isn't in the local DB). Requires `testray.client_id`/`testray.client_secret` in `config.yml`. |
+
+### Examples
 
 ```bash
-python3 -m apps.triage.prepare from-csv \
-    --baseline-build 451312408 \
-    --target-csv ~/Downloads/case_results.csv \
-    --target-build-id 462975400 \
-    --target-hash 77445e4a3a4725acd868027493b96ef41d6afbe8
+# Both builds in testray_analytical (the historical PoC case).
+python3 -m apps.triage.prepare \
+    --baseline-source db --baseline-build-id 451312408 \
+    --target-source   db --target-build-id   462975400
+
+# DB baseline; target from a Testray CSV export (target too new for the dump).
+python3 -m apps.triage.prepare \
+    --baseline-source db  --baseline-build-id 451312408 \
+    --target-source   csv --target-build-id   462975400 \
+        --target-csv ~/Downloads/case_results.csv \
+        --target-hash 77445e4a3a4725acd868027493b96ef41d6afbe8
+
+# DB baseline; target fetched live from Testray REST.
+python3 -m apps.triage.prepare \
+    --baseline-source db  --baseline-build-id 451312408 \
+    --target-source   api --target-build-id   462975400
+
+# Fully detached — no local DB required. Both sides from Testray REST.
+python3 -m apps.triage.prepare \
+    --baseline-source api --baseline-build-id 451312408 --baseline-hash <sha> \
+    --target-source   api --target-build-id   462975400 --target-hash   <sha>
 ```
 
-The CSV has no `case_id`, so matching to the baseline happens on
-`(Case Name, Component)`. Baseline's `case_id` and `case_flaky` are
-inherited on match; unmatched target rows are dropped (they can't be
-persisted to `fact_triage_results`).
+**CSV matching:** CSV exports have no `case_id`, so matching to the
+other side happens on `(Case Name, Component)`. The side with a
+`case_id` contributes it on join; rows that don't match anywhere are
+dropped (they can't be persisted to `fact_triage_results`).
 
-Dev supplies `--target-build-id` and `--target-hash` manually because the
-Testray export doesn't include them. If the target build is also in
-`dim_build`, its metadata fills in automatically.
+**`api` Jira gap.** API responses don't carry `linked_issues` directly —
+the `jira:` line is absent from per-failure sections in `prompt.md` when
+the target is `api`. Classification still works; use `db` or `csv` on
+the target if Jira ticket context matters. `prepare.py` prints this
+warning at runtime.
 
-### `from-api` — baseline in DB, target fetched live from Testray REST
+**`csv × api` is not supported today.** CSV has names, no id; API has id,
+no names — no common join key. `prepare.py` hard-errors with a PoC note.
+Workarounds: use `db` on at least one side, or use the same source on
+both sides (`api × api`, `csv × csv`).
 
-Used when the target build is fresher than your dump and you'd rather
-not download a CSV. Requires `testray.client_id` + `testray.client_secret`
-in `config.yml` (OAuth2 client_credentials).
+Expected API fetch time: ~1.5 minutes per side for ~15k case results (30
+pages × 500, 0.3s between).
 
-```bash
-python3 -m apps.triage.prepare from-api \
-    --baseline-build 451312408 \
-    --target-build-id 462975400
-    # --target-hash is optional if the target is also in dim_build
-```
-
-Expected: ~1.5 minutes for ~15k case results (30 pages × 500, 0.3s between).
-
-**Known gap — no Jira tickets in API mode.** `linked_issues` is not
-populated because the Jira reference isn't a direct field on the case
-result object. In `diff_list.csv` and the generated `prompt.md`, the
-`jira:` line will be missing for target-side failures. Classification
-still works, but you won't see Jira ticket context per failure. If that
-context matters for your session, use `from-db` or `from-csv` instead.
-`prepare.py from-api` prints this warning at runtime.
-
-### Classify + submit (same for all modes)
+### Classify + submit (same for all source combos)
 
 ```bash
 # 2. Classify inside your own Claude Code session:
@@ -288,11 +294,17 @@ app.properties, bnd.bnd, packageinfo, *.xml, *.properties, *.yml, *.yaml,
 
 ## Backlog
 
-- **Jira enrichment in `from-api`** — `linked_issues` is null in API mode
-  because the Jira ticket isn't a direct field on the caseresult object.
-  Options: (a) follow the subtask link per result and resolve jira there;
-  (b) accept the gap since most BUG classifications name a culprit file
-  not a Jira ticket.
+- **`csv × api` join gap** — the two lossy sources can't be joined
+  directly (CSV has names but no `case_id`; API has `case_id` but no
+  names). Unblock by enriching one side: either follow the case link per
+  API caseresult to populate names, or look up CSV rows against the
+  Testray API by `(Case Name, Component)` to get `case_id`. Either gives
+  us the missing 2 of 9 combos.
+- **Jira enrichment for `api` sources** — `linked_issues` is null when a
+  side is `api` because the Jira ticket isn't a direct field on the
+  caseresult object. Options: (a) follow the subtask link per result and
+  resolve jira there; (b) accept the gap since most BUG classifications
+  name a culprit file not a Jira ticket.
 - **Jira ticket auto-creation** (`create_jira_tickets.py`): Read
   `fact_triage_results` for a build, filter to BUG + NEEDS_REVIEW where
   `linked_issues` is null, create LPD tickets via Jira REST, write

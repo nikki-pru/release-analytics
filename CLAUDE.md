@@ -175,6 +175,14 @@ labels now determines quality of the model later.
   scripts own the same fact table with incompatible grains. Pick an owner
   (likely `load_testray.R`) and drop the fact_test_quality upsert from
   cofailure, or split into a new `fact_test_signal_score` table.
+- **Triage `csv × api` join gap** — `prepare.py` hard-errors when one
+  side is `csv` and the other is `api`. CSV exports carry
+  `(case_name, component_name)` but no `case_id`; API responses carry
+  `case_id` but no names — no common join key. Unblock by enriching one
+  side: (a) follow the case link per API caseresult to populate
+  `case_name` / `component_name`, or (b) look up CSV rows against the
+  Testray API by `(Case Name, Component)` to get `case_id`. Either
+  gives us the remaining 2 of 9 source combos.
 - Feature-flagged churn dampening — weight stored, not yet consumed by
   scoring or export
 - `is_forecast_row` = FALSE for all rows — fix pending in

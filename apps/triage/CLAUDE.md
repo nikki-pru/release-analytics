@@ -11,20 +11,34 @@ full rubric, schema, and file contracts.
 
 ## Session shape — prepare → classify → submit
 
-Three input modes:
+Each side (baseline, target) independently chooses a source: `db`
+(testray_analytical), `csv` (Testray CSV export), or `api` (Testray REST,
+OAuth2 client_credentials). Same flag pattern on both sides.
 
 ```
-# Both builds in testray_analytical
-python3 -m apps.triage.prepare from-db --build-a <A> --build-b <B>
+python3 -m apps.triage.prepare \
+    --baseline-source {db,csv,api} --baseline-build-id <A> \
+        [--baseline-csv path/to/case_results.csv] \
+        [--baseline-hash <sha>] [--baseline-name <str>] \
+    --target-source   {db,csv,api} --target-build-id   <B> \
+        [--target-csv   path/to/case_results.csv] \
+        [--target-hash   <sha>] [--target-name   <str>]
+```
 
-# Baseline in DB; target from a Testray CSV export (offline)
-python3 -m apps.triage.prepare from-csv \
-    --baseline-build <A> --target-csv path/to/case_results.csv \
-    --target-build-id <B> --target-hash <sha>
+Per-source arg rules:
+- `db` → nothing beyond `--{side}-build-id`; hash/name/routine from `dim_build`.
+- `csv` → `--{side}-csv` + `--{side}-hash` required (exports carry no
+  sha); optional `--{side}-name`.
+- `api` → build-id required; `--{side}-hash` optional, falls back to
+  `dim_build`.
 
-# Baseline in DB; target fetched live from Testray REST (OAuth2)
-python3 -m apps.triage.prepare from-api \
-    --baseline-build <A> --target-build-id <B> [--target-hash <sha>]
+**Combo not supported today:** `csv × api` (either direction). CSV carries
+`(case_name, component_name)` but no `case_id`; API carries `case_id` but
+no names — no common join key. `prepare` hard-errors with a PoC note
+pointing at enrichment backlog. All other combos work, including fully
+detached `api × api` (no local DB needed).
+
+```
       ↓
 runs/r_<ts>_<A>_<B>/
    ├── run.yml              (metadata: builds, hashes, routine, classifier)

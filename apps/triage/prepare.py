@@ -4,10 +4,15 @@ apps/triage/prepare.py
 Build a triage run bundle for the dev's own Claude Code session to classify.
 
 Usage:
-    python3 apps/triage/prepare.py from-db --build-a <A> --build-b <B>
+    python3 -m apps.triage.prepare \
+        --baseline-source {db,csv,api} --baseline-build-id <N> \
+            [--baseline-csv <path>] [--baseline-hash <sha>] [--baseline-name <str>] \
+        --target-source   {db,csv,api} --target-build-id <N> \
+            [--target-csv <path>] [--target-hash <sha>] [--target-name <str>] \
+        [--classifier <label>]
 
 Emits apps/triage/runs/r_<ts>_<A>_<B>/:
-    run.yml              metadata (build ids, hashes, routine, input mode)
+    run.yml              metadata (build ids, hashes, routine, sources)
     diff_list.csv        one row per PASSED→FAILED/BLOCKED/UNTESTED case,
                          enriched with component/team + pre_classification
     hunks.txt            filtered git diff (hunks matching failing tests)
@@ -18,8 +23,6 @@ Emits apps/triage/runs/r_<ts>_<A>_<B>/:
 
 The dev's Claude Code session reads prompt.md, classifies, writes
 results.json. Then `submit.py <run_dir>` validates and upserts.
-
-CSV and API input modes are planned but not yet implemented here (step 2).
 """
 
 import argparse
@@ -30,6 +33,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +50,11 @@ RUNS_DIR     = TRIAGE_DIR / "runs"
 CONFIG_PATH  = PROJECT_ROOT / "config" / "config.yml"
 
 DEFAULT_CLASSIFIER = "agent:claude-opus-4-7"
+
+SOURCE_DB  = "db"
+SOURCE_CSV = "csv"
+SOURCE_API = "api"
+SOURCES    = (SOURCE_DB, SOURCE_CSV, SOURCE_API)
 
 GIT_DIFF_EXCLUDES = [
     ":!**/artifact.properties",
@@ -71,6 +80,25 @@ GIT_DIFF_EXCLUDES = [
 
 
 # ---------------------------------------------------------------------------
+# Side specification
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SideSpec:
+    """One side of the triage pair (baseline or target)."""
+    role:     str            # "baseline" or "target"
+    source:   str            # SOURCE_DB | SOURCE_CSV | SOURCE_API
+    build_id: int
+    csv:      Path | None = None
+    hash:     str  | None = None
+    name:     str  | None = None
+
+    @property
+    def flag_prefix(self) -> str:
+        return f"--{self.role}"
+
+
+# ---------------------------------------------------------------------------
 # Config + DB
 # ---------------------------------------------------------------------------
 
@@ -91,30 +119,33 @@ def _strip_sql_comments(sql: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: test_diff — three input paths, one output shape
+# Step 1: test_diff — per-source fetchers, one output shape
 # ---------------------------------------------------------------------------
 #
-# The downstream pipeline (git diff → hunks → prompt) needs a DataFrame with
-# these columns:
+# Downstream (git diff → hunks → prompt) needs a DataFrame with:
 #
-#   testray_case_id, test_case, known_flaky, testray_component_name,
-#   status_a, status_b, error_message, linked_issues
+#   case_id, case_name, case_flaky, component_name, team_name,
+#   status, errors, jira_issue
 #
-# We produce that shape from three possible sources for the target side:
-#   - from-db  (both baseline and target from testray_analytical)
-#   - from-csv (baseline from DB, target from a Testray CSV export)
-#   - from-api (baseline from DB, target from Testray REST) — future
+# Three sources, each lossy in different dimensions:
+#
+#   source  case_id   case_name   component_name   linked_issues
+#   ------  -------   ---------   --------------   -------------
+#   db        ✓          ✓             ✓                ✓
+#   csv       ✗          ✓             ✓                ✓
+#   api       ✓          ✗             ✗                ✗ (backlog)
+#
+# Combos that share at least one of {case_id, (case_name, component_name)}
+# work; csv×api does not (see validate_combo).
 # ---------------------------------------------------------------------------
 
-# Worst-status-wins order for de-duping retry rows in a Testray CSV export.
+# Worst-status-wins order for de-duping retry rows.
 _STATUS_RANK = {"FAILED": 4, "BLOCKED": 3, "UNTESTED": 2, "PASSED": 1}
 
 
 def fetch_build_caseresults(build_id: int, db_cfg: dict) -> pd.DataFrame:
-    """All case results for a single build from testray_analytical — returns
-    raw rows (one per run × case). Aggregation happens inside
-    compute_test_diff so baseline and target can use different semantics.
-    """
+    """All case results for a single build from testray_analytical — raw rows
+    (one per run × case). Aggregation happens in compute_test_diff."""
     sql = """
         SELECT case_id, case_name, case_flaky, component_name, team_name,
                status, errors, jira_issue
@@ -134,7 +165,7 @@ def _testray_oauth_token(cfg: dict) -> str:
     if not cfg.get("client_id") or not cfg.get("client_secret"):
         raise SystemExit(
             "testray.client_id / testray.client_secret missing from config.yml. "
-            "Both are required for from-api mode."
+            "Both are required for api sources."
         )
     data = urllib.parse.urlencode({
         "grant_type":    "client_credentials",
@@ -154,8 +185,7 @@ def _testray_fetch_paginated(
     endpoint: str, params: dict, token: str, base_url: str,
     page_size: int = 500, sleep_between: float = 0.3,
 ) -> list[dict]:
-    """Follow Liferay Objects pagination until lastPage. Handles token
-    refresh on 401 by raising SystemExit (caller should get a fresh one)."""
+    """Follow Liferay Objects pagination until lastPage."""
     base = base_url.rstrip("/")
     items: list[dict] = []
     page = 1
@@ -184,15 +214,10 @@ def _testray_fetch_paginated(
 
 
 def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
-    """Fetch all case results for a build via Testray REST. Returns the
-    same column shape as parse_testray_csv / fetch_build_caseresults, with
-    `case_name`, `component_name`, `team_name` left blank (filled from
-    baseline on case_id match in compute_test_diff).
-
-    `linked_issues` (Jira) is NOT populated — not a direct field on the
-    caseresult object. Documented gap; can be enriched later by following
-    the subtask link if needed.
-    """
+    """Fetch all case results for a build via Testray REST. Same column shape
+    as fetch_build_caseresults / parse_testray_csv; `case_name`,
+    `component_name`, `team_name`, `jira_issue` are left blank (Jira gap is
+    documented backlog — enrich via subtask link if needed)."""
     token = _testray_oauth_token(cfg)
     items = _testray_fetch_paginated(
         "/o/c/caseresults",
@@ -220,10 +245,8 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
 
 
 def parse_testray_csv(path: Path) -> pd.DataFrame:
-    """Parse a Testray CSV export (one build's results) into a DataFrame with
-    the same column names as fetch_build_caseresults. `case_id` is blank —
-    it's filled later by matching to the baseline DataFrame on
-    (case_name, component). Returns raw rows (one per run)."""
+    """Parse a Testray CSV export into the common shape. `case_id` is blank —
+    filled later by joining to a side that has names and case_ids."""
     raw = pd.read_csv(path)
     required = {"Case Name", "Component", "Status"}
     missing = required - set(raw.columns)
@@ -233,7 +256,7 @@ def parse_testray_csv(path: Path) -> pd.DataFrame:
     return pd.DataFrame({
         "case_id":        [None] * len(raw),
         "case_name":      raw["Case Name"].astype(str),
-        "case_flaky":     [None] * len(raw),    # filled from baseline on match
+        "case_flaky":     [None] * len(raw),
         "component_name": raw["Component"].astype(str),
         "team_name":      raw.get("Team",    pd.Series([None] * len(raw))),
         "status":         raw["Status"].astype(str),
@@ -242,16 +265,26 @@ def parse_testray_csv(path: Path) -> pd.DataFrame:
     })
 
 
+def fetch_caseresults(spec: SideSpec, cfg: dict) -> pd.DataFrame:
+    """Dispatch a SideSpec to the matching fetcher."""
+    if spec.source == SOURCE_DB:
+        return fetch_build_caseresults(spec.build_id, cfg["databases"]["testray"])
+    if spec.source == SOURCE_CSV:
+        assert spec.csv is not None
+        return parse_testray_csv(spec.csv)
+    if spec.source == SOURCE_API:
+        return fetch_build_caseresults_api(spec.build_id, cfg["testray"])
+    raise SystemExit(f"Unknown source: {spec.source}")
+
+
 def _aggregate_baseline(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
-    """For each key, status='PASSED' if any retry passed — otherwise worst
-    status wins. Matches the semantics of test_diff.sql's PASSED filter,
-    where any passing run is enough to count the case as "passing" in A."""
+    """Per key, status='PASSED' if any retry passed; else worst status wins.
+    Matches test_diff.sql semantics — any passing run counts as passing in A."""
     if df.empty:
         return df
     df = df.copy()
     df["_is_pass"] = (df["status"] == "PASSED").astype(int)
     df["_rank"]    = df["status"].map(_STATUS_RANK).fillna(0).astype(int)
-    # Prefer passing rows; fall back to worst-status row.
     df = df.sort_values(["_is_pass", "_rank"], ascending=[False, False])
     out = df.drop_duplicates(subset=key_cols, keep="first") \
             .drop(columns=["_is_pass", "_rank"]) \
@@ -260,8 +293,7 @@ def _aggregate_baseline(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
 
 
 def _aggregate_target(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
-    """For each key, keep the worst-status row — any failed retry should
-    surface (and bring its error_message / linked issues with it)."""
+    """Per key, keep the worst-status row — any failed retry should surface."""
     if df.empty:
         return df
     df = df.copy()
@@ -274,15 +306,12 @@ def _aggregate_target(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
 
 
 def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFrame:
-    """Inner-join baseline (A) and target (B) and keep cases that PASSED in A
-    and FAILED/BLOCKED/UNTESTED in B.
+    """Inner-join baseline and target; keep cases that PASSED in A and
+    FAILED/BLOCKED/UNTESTED in B.
 
-    Join key:
-      - Both sides have non-null case_id → join on case_id (DB × DB, DB × API).
-      - Target lacks case_id (Testray CSV) → join on (case_name, component).
-        Baseline's case_id is inherited on match; unmatched target rows are
-        dropped (no persistable key).
-    """
+    Join key: `case_id` if the target has one (db, api targets); otherwise
+    `(case_name, component_name)` (csv targets). A final dropna on
+    `testray_case_id` discards rows with no persistable id."""
     if baseline.empty or target.empty:
         return pd.DataFrame()
 
@@ -298,12 +327,10 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
         & merged["status_b"].isin(["FAILED", "BLOCKED", "UNTESTED"])
     ].copy()
 
-    # After merge, the join keys stay un-suffixed; other shared columns get
-    # _a / _b suffixes. Pick the baseline side for identity metadata.
     case_id_col = "case_id"          if target_has_ids     else "case_id_a"
     name_col    = "case_name_a"      if target_has_ids     else "case_name"
     comp_col    = "component_name_a" if target_has_ids     else "component_name"
-    flaky_col   = "case_flaky_a"   # case_flaky is always a shared non-join column
+    flaky_col   = "case_flaky_a"
 
     out = pd.DataFrame({
         "testray_case_id":        diff[case_id_col],
@@ -320,12 +347,10 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
 
 
 # ---------------------------------------------------------------------------
-# Step 2: git_hash + routine lookup from dim_build
+# Step 2: metadata — dim_build lookup per side, fall back to spec args
 # ---------------------------------------------------------------------------
 
 def fetch_build_metadata(build_id: int, db_cfg: dict) -> dict | None:
-    """Fetch git_hash / routine_id / build_name for a single build from
-    dim_build. Returns None if not found."""
     sql = """
         SELECT build_id, build_name, git_hash, routine_id
         FROM dim_build
@@ -338,23 +363,57 @@ def fetch_build_metadata(build_id: int, db_cfg: dict) -> dict | None:
     return dict(row) if row else None
 
 
-def resolve_build_metadata(build_a: int, build_b: int, db_cfg: dict) -> dict:
-    ra = fetch_build_metadata(build_a, db_cfg)
-    rb = fetch_build_metadata(build_b, db_cfg)
-    missing = [b for b, r in ((build_a, ra), (build_b, rb)) if r is None]
-    if missing:
-        raise SystemExit(f"Build(s) not in dim_build: {missing}")
-    if ra["routine_id"] != rb["routine_id"]:
-        print(f"WARNING: builds are on different routines "
-              f"(A={ra['routine_id']}, B={rb['routine_id']}). "
-              f"Diff may still be meaningful but test_diff will miss cases "
-              f"that don't run on both.", file=sys.stderr)
+def resolve_side_metadata(spec: SideSpec, testray_db: dict) -> dict:
+    """Resolve git_hash / routine_id / build_name for one side.
+
+    Strategy (per side):
+      - Try dim_build lookup.
+      - If source=db: row MUST be found.
+      - Else: merge dim_build values (if any) with spec-supplied values
+        (hash, name). Spec wins for hash/name if both are present (with a
+        warning); dim_build's routine_id is used if present.
+      - If git_hash still unresolved, error with guidance to pass the
+        appropriate --{role}-hash flag.
+    """
+    row = fetch_build_metadata(spec.build_id, testray_db)
+
+    if spec.source == SOURCE_DB:
+        if row is None:
+            raise SystemExit(
+                f"Build {spec.build_id} not found in dim_build "
+                f"(source={SOURCE_DB}). Re-run the testray load, "
+                f"or switch {spec.flag_prefix}-source to csv/api."
+            )
+        return {
+            "build_name": row["build_name"],
+            "git_hash":   row["git_hash"],
+            "routine_id": row["routine_id"],
+        }
+
+    # csv / api
+    git_hash = spec.hash or (row or {}).get("git_hash")
+    if row and spec.hash and row["git_hash"] != spec.hash:
+        print(f"WARNING: {spec.flag_prefix}-hash={spec.hash[:12]} differs from "
+              f"dim_build git_hash={row['git_hash'][:12]}. Using "
+              f"{spec.flag_prefix}-hash.", file=sys.stderr)
+
+    if not git_hash:
+        raise SystemExit(
+            f"Build {spec.build_id} is not in dim_build and no "
+            f"{spec.flag_prefix}-hash was supplied. Pass "
+            f"{spec.flag_prefix}-hash <sha>."
+        )
+
+    fallback_name = (
+        spec.name
+        or (row or {}).get("build_name")
+        or (f"{spec.source}:{spec.csv.name}" if spec.source == SOURCE_CSV
+            else f"{spec.source}:{spec.build_id}")
+    )
     return {
-        "hash_a":       ra["git_hash"],
-        "hash_b":       rb["git_hash"],
-        "routine_id":   ra["routine_id"],
-        "build_a_name": ra["build_name"],
-        "build_b_name": rb["build_name"],
+        "build_name": fallback_name,
+        "git_hash":   git_hash,
+        "routine_id": (row or {}).get("routine_id"),
     }
 
 
@@ -389,7 +448,7 @@ def run_git_diff(git_repo: Path, hash_a: str, hash_b: str, out_path: Path) -> in
 # ---------------------------------------------------------------------------
 
 def derive_test_fragments(df: pd.DataFrame) -> set[str]:
-    """Extract module/class tokens from test_case names — used by
+    """Module/class tokens from test_case names — fed to
     extract_relevant_hunks.py to filter the diff to relevant files."""
     fragments: set[str] = set()
     for name in df["test_case"].dropna():
@@ -439,8 +498,6 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     if "team_name" not in df.columns:
         df["team_name"] = None
 
-    # CSV-based team_name enrichment (no DB dependency — works on dev laptops
-    # without release_analytics DB).
     df["team_name"] = df["component_name"].apply(
         prompt_helpers.team_for_component
     ).fillna(df["team_name"])
@@ -480,7 +537,6 @@ RESULTS_SCHEMA = {
                     "specific_change": {"type": ["string", "null"]},
                     "reason":          {"type": "string"},
                 },
-                # BUG must name a culprit_file — enforced in submit.py too
                 "if":   {"properties": {"classification": {"const": "BUG"}}},
                 "then": {"required": ["culprit_file"],
                           "properties": {"culprit_file": {"type": "string"}}},
@@ -496,14 +552,16 @@ def write_results_schema(run_dir: Path) -> None:
     )
 
 
-def write_run_yml(run_dir: Path, *, run_id: str, input_mode: str,
+def write_run_yml(run_dir: Path, *, run_id: str,
+                  baseline_source: str, target_source: str,
                   build_a: int, build_b: int, hash_a: str, hash_b: str,
-                  routine_id: int, build_a_name: str, build_b_name: str,
+                  routine_id: int | None, build_a_name: str, build_b_name: str,
                   classifier: str, total_failures: int, auto_classified: int,
                   flaky_excluded: int) -> None:
     metadata = {
         "run_id":              run_id,
-        "input_mode":          input_mode,
+        "baseline_source":     baseline_source,
+        "target_source":       target_source,
         "classifier":          classifier,
         "build_id_a":          build_a,
         "build_id_b":          build_b,
@@ -601,14 +659,12 @@ Add `--no-upsert` to inspect the validated summary without writing to `fact_tria
 
 """
 
-# Emitted after PROMPT_HEADER (and after the optional "UI chrome changes"
-# section), immediately before the per-failure blocks.
 _FAILURES_HEADER = "\n---\n\n## Failures to classify\n\n"
 
 
 def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
                  build_a: int, build_b: int, hash_a: str, hash_b: str,
-                 routine_id: int, build_a_name: str, build_b_name: str,
+                 routine_id: int | None, build_a_name: str, build_b_name: str,
                  df_to_classify: pd.DataFrame, df_auto: pd.DataFrame,
                  df_flaky: pd.DataFrame, hunks_path: Path) -> None:
 
@@ -617,10 +673,6 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
     except FileNotFoundError:
         diff_blocks = {}
 
-    # Surface shared-UI-chrome files changed anywhere in the diff. Useful
-    # evidence for cross-component failures where the failing test's
-    # component has no matching hunk but a shared layout/nav/taglib file
-    # was touched.
     chrome_changes = prompt_helpers.find_ui_chrome_changes(diff_blocks)
 
     chrome_lines: list[str] = []
@@ -710,7 +762,7 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
         build_a=build_a, build_b=build_b,
         hash_a_short=hash_a[:12] if hash_a else "?",
         hash_b_short=hash_b[:12] if hash_b else "?",
-        routine_id=routine_id,
+        routine_id=routine_id if routine_id is not None else "unknown",
         build_a_name=build_a_name,
         build_b_name=build_b_name,
         n_to_classify=len(df_to_classify),
@@ -728,18 +780,40 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator — from-db mode
+# Orchestrator
 # ---------------------------------------------------------------------------
+
+def validate_combo(baseline: SideSpec, target: SideSpec) -> None:
+    """Hard-error on combos we can't currently join.
+
+    csv × api (either direction): CSV carries (case_name, component_name)
+    but no case_id; API carries case_id but no (case_name, component_name).
+    No common key → zero-row join.
+    """
+    sides = {baseline.source, target.source}
+    if sides == {SOURCE_CSV, SOURCE_API}:
+        raise SystemExit(
+            "For this PoC, csv and api sources can't be combined "
+            f"(baseline={baseline.source}, target={target.source}). CSV exports "
+            "carry (case_name, component_name) but no case_id; API responses "
+            "carry case_id but no names. No common join key.\n"
+            "\n"
+            "Workarounds today: use db on at least one side, or use the same "
+            "source on both sides (api×api, csv×csv).\n"
+            "\n"
+            "Backlog: enrich api rows with case names (follow the case link), "
+            "or csv rows with case_ids (lookup by (name, component))."
+        )
+
 
 def _finalize_bundle(
     df: pd.DataFrame, run_id: str, run_dir: Path,
-    classifier: str, input_mode: str,
+    classifier: str,
+    baseline_source: str, target_source: str,
     build_a: int, build_b: int, hash_a: str, hash_b: str,
-    routine_id: int, build_a_name: str, build_b_name: str,
+    routine_id: int | None, build_a_name: str, build_b_name: str,
     git_repo: Path,
 ) -> Path:
-    """Shared steps 3-6: git diff → hunks → enrich → prompt + schema + run.yml.
-    `df` is the compute_test_diff output (pre-dedup)."""
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
     diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path)
@@ -785,7 +859,9 @@ def _finalize_bundle(
     )
     write_run_yml(
         run_dir,
-        run_id=run_id, input_mode=input_mode, classifier=classifier,
+        run_id=run_id,
+        baseline_source=baseline_source, target_source=target_source,
+        classifier=classifier,
         build_a=build_a, build_b=build_b,
         hash_a=hash_a, hash_b=hash_b,
         routine_id=routine_id,
@@ -802,203 +878,76 @@ def _finalize_bundle(
     return run_dir
 
 
-def prepare_from_db(build_a: int, build_b: int, classifier: str) -> Path:
-    cfg      = load_config()
-    testray  = cfg["databases"]["testray"]
-    git_repo = Path(cfg["git"]["repo_path"]).expanduser()
+def prepare(baseline: SideSpec, target: SideSpec, classifier: str) -> Path:
+    validate_combo(baseline, target)
+
+    cfg         = load_config()
+    testray_db  = cfg["databases"]["testray"]
+    git_repo    = Path(cfg["git"]["repo_path"]).expanduser()
 
     ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_id  = f"r_{ts}_{build_a}_{build_b}"
+    run_id  = f"r_{ts}_{baseline.build_id}_{target.build_id}"
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"→ Step 1/6 test_diff (DB × DB) …")
-    baseline = fetch_build_caseresults(build_a, testray)
-    target   = fetch_build_caseresults(build_b, testray)
-    if baseline.empty or target.empty:
-        raise SystemExit(f"No case results for build_a={build_a} or build_b={build_b}.")
-    df = compute_test_diff(baseline, target)
-    if df.empty:
-        raise SystemExit("test_diff returned 0 rows.")
-    print(f"   {len(df)} regressions — status_b: "
-          f"{df['status_b'].value_counts().to_dict()}")
+    print(f"→ Step 1/6 test_diff "
+          f"(baseline={baseline.source} × target={target.source}) …")
+    baseline_df = fetch_caseresults(baseline, cfg)
+    if baseline_df.empty:
+        raise SystemExit(f"No case results for baseline build {baseline.build_id} "
+                         f"(source={baseline.source}).")
+    target_df = fetch_caseresults(target, cfg)
+    if target_df.empty:
+        raise SystemExit(f"No case results for target build {target.build_id} "
+                         f"(source={target.source}).")
+    print(f"   baseline rows: {len(baseline_df)}  target rows: {len(target_df)}")
 
-    print(f"→ Step 2/6 build metadata …")
-    meta = resolve_build_metadata(build_a, build_b, testray)
-    print(f"   routine_id={meta['routine_id']}  "
-          f"A={meta['hash_a'][:12]}  B={meta['hash_b'][:12]}")
+    if target.source == SOURCE_API:
+        print("   NOTE: api targets do not populate `linked_issues` — the Jira",
+              file=sys.stderr)
+        print("         column in diff_list.csv will be blank for target-side failures.",
+              file=sys.stderr)
+        print("         Use db or csv on the target if Jira ticket context is needed.",
+              file=sys.stderr)
 
-    return _finalize_bundle(
-        df=df, run_id=run_id, run_dir=run_dir,
-        classifier=classifier, input_mode="from-db",
-        build_a=build_a, build_b=build_b,
-        hash_a=meta["hash_a"], hash_b=meta["hash_b"],
-        routine_id=meta["routine_id"],
-        build_a_name=meta["build_a_name"], build_b_name=meta["build_b_name"],
-        git_repo=git_repo,
-    )
-
-
-def prepare_from_api(
-    baseline_build: int,
-    target_build_id: int,
-    target_hash: str | None,
-    classifier: str,
-    target_name: str | None = None,
-) -> Path:
-    """Baseline from DB, target fetched live from Testray REST.
-
-    If target_hash is omitted, we try to resolve it from dim_build (in case
-    the build is already ingested). Otherwise it's required.
-    """
-    cfg          = load_config()
-    testray_db   = cfg["databases"]["testray"]
-    testray_api  = cfg["testray"]
-    git_repo     = Path(cfg["git"]["repo_path"]).expanduser()
-
-    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_id  = f"r_{ts}_{baseline_build}_{target_build_id}"
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"→ Step 1/6 test_diff (DB × Testray API) …")
-    baseline = fetch_build_caseresults(baseline_build, testray_db)
-    if baseline.empty:
-        raise SystemExit(f"No case results in DB for baseline build {baseline_build}.")
-    print(f"   baseline rows: {len(baseline)}")
-    print(f"   fetching target build {target_build_id} from Testray API …")
-    target = fetch_build_caseresults_api(target_build_id, testray_api)
-    if target.empty:
-        raise SystemExit(f"Testray API returned 0 case results for build {target_build_id}.")
-    print(f"   target rows:   {len(target)}")
-    print(f"   NOTE: from-api does not populate `linked_issues` — the Jira",
-          file=sys.stderr)
-    print(f"         column in diff_list.csv will be blank for target-side failures.",
-          file=sys.stderr)
-    print(f"         Use from-db or from-csv if Jira ticket context is needed.",
-          file=sys.stderr)
-
-    df = compute_test_diff(baseline, target)
-    if df.empty:
-        raise SystemExit("test_diff returned 0 rows (no PASSED→FAILED after matching).")
-    print(f"   {len(df)} regressions — status_b: "
-          f"{df['status_b'].value_counts().to_dict()}")
-
-    print(f"→ Step 2/6 build metadata …")
-    ra = fetch_build_metadata(baseline_build, testray_db)
-    if ra is None:
-        raise SystemExit(f"Baseline build {baseline_build} not in dim_build.")
-    rb = fetch_build_metadata(target_build_id, testray_db)
-    resolved_hash = target_hash or (rb or {}).get("git_hash")
-    if not resolved_hash:
-        raise SystemExit(
-            f"Target build {target_build_id} is not in dim_build and no "
-            f"--target-hash was supplied. Pass --target-hash <sha>."
+    if target.source == SOURCE_CSV:
+        matched = target_df.merge(
+            baseline_df[["case_name", "component_name"]].dropna(),
+            on=["case_name", "component_name"], how="inner",
         )
-    target_final = {
-        "build_name": (rb or {}).get("build_name") or target_name or f"api:{target_build_id}",
-        "git_hash":   resolved_hash,
-        "routine_id": (rb or {}).get("routine_id") or ra["routine_id"],
-    }
-    if rb and target_hash and rb["git_hash"] != target_hash:
-        print(f"WARNING: --target-hash={target_hash[:12]} differs from dim_build "
-              f"git_hash={rb['git_hash'][:12]}. Using --target-hash.",
-              file=sys.stderr)
-    print(f"   routine_id={target_final['routine_id']}  "
-          f"A={ra['git_hash'][:12]}  B={target_final['git_hash'][:12]}")
+        unmatched = len(target_df) - len(matched)
+        if unmatched > 0:
+            print(f"   unmatched target rows: {unmatched} "
+                  f"(no baseline match — cannot persist)")
 
-    return _finalize_bundle(
-        df=df, run_id=run_id, run_dir=run_dir,
-        classifier=classifier, input_mode="from-api",
-        build_a=baseline_build, build_b=target_build_id,
-        hash_a=ra["git_hash"], hash_b=target_final["git_hash"],
-        routine_id=target_final["routine_id"],
-        build_a_name=ra["build_name"],
-        build_b_name=target_final["build_name"],
-        git_repo=git_repo,
-    )
-
-
-def prepare_from_csv(
-    baseline_build: int,
-    target_csv: Path,
-    target_build_id: int,
-    target_hash: str,
-    classifier: str,
-    target_name: str | None = None,
-) -> Path:
-    """Baseline from DB, target from a Testray CSV export.
-
-    Dev supplies target_build_id + target_hash because the CSV doesn't carry
-    them. If the target build happens to also be in dim_build, metadata fills
-    in automatically; otherwise the dev's values are authoritative.
-    """
-    cfg      = load_config()
-    testray  = cfg["databases"]["testray"]
-    git_repo = Path(cfg["git"]["repo_path"]).expanduser()
-
-    target_csv = target_csv.expanduser().resolve()
-    if not target_csv.exists():
-        raise SystemExit(f"Target CSV not found: {target_csv}")
-
-    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_id  = f"r_{ts}_{baseline_build}_{target_build_id}"
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"→ Step 1/6 test_diff (DB × CSV) …")
-    baseline = fetch_build_caseresults(baseline_build, testray)
-    if baseline.empty:
-        raise SystemExit(f"No case results in DB for baseline build {baseline_build}.")
-    target = parse_testray_csv(target_csv)
-    if target.empty:
-        raise SystemExit(f"Target CSV is empty: {target_csv}")
-
-    # Sanity diagnostic: how many target rows will actually match the baseline?
-    matched = target.merge(
-        baseline[["case_name", "component_name"]],
-        on=["case_name", "component_name"], how="inner",
-    )
-    print(f"   baseline rows: {len(baseline)}")
-    print(f"   target rows:   {len(target)}  (matched to baseline: {len(matched)})")
-    unmatched = len(target) - len(matched)
-    if unmatched > 0:
-        print(f"   unmatched:     {unmatched} (target-only — no case_id, cannot persist)")
-
-    df = compute_test_diff(baseline, target)
+    df = compute_test_diff(baseline_df, target_df)
     if df.empty:
         raise SystemExit("test_diff returned 0 rows (no PASSED→FAILED after matching).")
     print(f"   {len(df)} regressions — status_b: "
           f"{df['status_b'].value_counts().to_dict()}")
 
     print(f"→ Step 2/6 build metadata …")
-    ra = fetch_build_metadata(baseline_build, testray)
-    if ra is None:
-        raise SystemExit(f"Baseline build {baseline_build} not in dim_build.")
-    # Target: try DB first, fall back to dev-supplied values.
-    rb = fetch_build_metadata(target_build_id, testray)
-    target_final = {
-        "build_id":   target_build_id,
-        "build_name": (rb or {}).get("build_name") or target_name or f"csv:{target_csv.name}",
-        "git_hash":   (rb or {}).get("git_hash")   or target_hash,
-        "routine_id": (rb or {}).get("routine_id") or ra["routine_id"],
-    }
-    if rb and rb["git_hash"] and rb["git_hash"] != target_hash:
-        print(f"WARNING: --target-hash={target_hash[:12]} differs from dim_build "
-              f"git_hash={rb['git_hash'][:12]}. Using --target-hash.",
-              file=sys.stderr)
-        target_final["git_hash"] = target_hash
-    print(f"   routine_id={target_final['routine_id']}  "
-          f"A={ra['git_hash'][:12]}  B={target_final['git_hash'][:12]}")
+    meta_a = resolve_side_metadata(baseline, testray_db)
+    meta_b = resolve_side_metadata(target,   testray_db)
+
+    routine_id = meta_a["routine_id"] or meta_b["routine_id"]
+    if meta_a["routine_id"] and meta_b["routine_id"] \
+            and meta_a["routine_id"] != meta_b["routine_id"]:
+        print(f"WARNING: builds are on different routines "
+              f"(A={meta_a['routine_id']}, B={meta_b['routine_id']}). "
+              f"Diff may still be meaningful but test_diff will miss cases "
+              f"that don't run on both.", file=sys.stderr)
+    print(f"   routine_id={routine_id}  "
+          f"A={meta_a['git_hash'][:12]}  B={meta_b['git_hash'][:12]}")
 
     return _finalize_bundle(
         df=df, run_id=run_id, run_dir=run_dir,
-        classifier=classifier, input_mode="from-csv",
-        build_a=baseline_build, build_b=target_build_id,
-        hash_a=ra["git_hash"], hash_b=target_final["git_hash"],
-        routine_id=target_final["routine_id"],
-        build_a_name=ra["build_name"],
-        build_b_name=target_final["build_name"],
+        classifier=classifier,
+        baseline_source=baseline.source, target_source=target.source,
+        build_a=baseline.build_id, build_b=target.build_id,
+        hash_a=meta_a["git_hash"], hash_b=meta_b["git_hash"],
+        routine_id=routine_id,
+        build_a_name=meta_a["build_name"], build_b_name=meta_b["build_name"],
         git_repo=git_repo,
     )
 
@@ -1007,71 +956,66 @@ def prepare_from_csv(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _add_side_args(ap: argparse.ArgumentParser, role: str) -> None:
+    """Add --{role}-source / --{role}-build-id / --{role}-csv / --{role}-hash /
+    --{role}-name to the parser."""
+    ap.add_argument(f"--{role}-source",   choices=SOURCES, required=True,
+                    help=f"Where to load the {role} build's case results from.")
+    ap.add_argument(f"--{role}-build-id", type=int, required=True,
+                    help=f"Build id for the {role} build.")
+    ap.add_argument(f"--{role}-csv",      type=Path, default=None,
+                    help=f"Path to Testray CSV export "
+                         f"(required when --{role}-source=csv).")
+    ap.add_argument(f"--{role}-hash",     default=None,
+                    help=f"Git hash for the {role} build. Required for csv; "
+                         f"for api, optional — falls back to dim_build.")
+    ap.add_argument(f"--{role}-name",     default=None,
+                    help=f"Optional display name for the {role} build.")
+
+
+def _build_spec(args: argparse.Namespace, role: str) -> SideSpec:
+    source = getattr(args, f"{role}_source")
+    csv    = getattr(args, f"{role}_csv")
+    hash_  = getattr(args, f"{role}_hash")
+
+    if source == SOURCE_CSV:
+        if csv is None:
+            raise SystemExit(f"--{role}-csv is required when --{role}-source=csv.")
+        csv = csv.expanduser().resolve()
+        if not csv.exists():
+            raise SystemExit(f"{role} CSV not found: {csv}")
+        if not hash_:
+            raise SystemExit(f"--{role}-hash is required when --{role}-source=csv "
+                             f"(CSV exports don't carry the build's git sha).")
+
+    if source != SOURCE_CSV and csv is not None:
+        print(f"WARNING: --{role}-csv ignored (source={source}).", file=sys.stderr)
+
+    return SideSpec(
+        role=role, source=source,
+        build_id=getattr(args, f"{role}_build_id"),
+        csv=csv if source == SOURCE_CSV else None,
+        hash=hash_,
+        name=getattr(args, f"{role}_name"),
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Prepare a triage run bundle for in-session classification.",
+        description="Prepare a triage run bundle for in-session classification. "
+                    "Each side (baseline, target) independently selects a source: "
+                    "db (testray_analytical), csv (Testray CSV export), or api "
+                    "(Testray REST).",
     )
-    sub = ap.add_subparsers(dest="mode", required=True)
-
-    db = sub.add_parser("from-db",
-        help="Both builds from testray_analytical.")
-    db.add_argument("--build-a", type=int, required=True, help="Baseline build id")
-    db.add_argument("--build-b", type=int, required=True, help="Target build id")
-    db.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
+    _add_side_args(ap, "baseline")
+    _add_side_args(ap, "target")
+    ap.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
                     help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
-
-    cv = sub.add_parser("from-csv",
-        help="Baseline from testray_analytical, target from a Testray CSV export.")
-    cv.add_argument("--baseline-build",  type=int, required=True,
-                    help="Baseline build id (must be in testray_analytical)")
-    cv.add_argument("--target-csv",      type=Path, required=True,
-                    help="Path to Testray CSV export for the target build")
-    cv.add_argument("--target-build-id", type=int, required=True,
-                    help="Build id for the target (written to fact_triage_results)")
-    cv.add_argument("--target-hash",     required=True,
-                    help="Git hash for the target build")
-    cv.add_argument("--target-name",     default=None,
-                    help="Optional display name for the target build")
-    cv.add_argument("--classifier",      default=DEFAULT_CLASSIFIER,
-                    help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
-
-    ap_api = sub.add_parser("from-api",
-        help="Baseline from testray_analytical, target fetched live from Testray REST "
-             "(OAuth2 client_credentials — needs testray.client_id/client_secret in config.yml).")
-    ap_api.add_argument("--baseline-build",  type=int, required=True,
-                        help="Baseline build id (must be in testray_analytical)")
-    ap_api.add_argument("--target-build-id", type=int, required=True,
-                        help="Target build id (fetched from Testray API)")
-    ap_api.add_argument("--target-hash",     default=None,
-                        help="Git hash for target. Optional if target is also "
-                             "in dim_build; required otherwise.")
-    ap_api.add_argument("--target-name",     default=None,
-                        help="Optional display name for the target build")
-    ap_api.add_argument("--classifier",      default=DEFAULT_CLASSIFIER,
-                        help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
 
     args = ap.parse_args()
-    if args.mode == "from-db":
-        prepare_from_db(args.build_a, args.build_b, args.classifier)
-    elif args.mode == "from-csv":
-        prepare_from_csv(
-            baseline_build=args.baseline_build,
-            target_csv=args.target_csv,
-            target_build_id=args.target_build_id,
-            target_hash=args.target_hash,
-            classifier=args.classifier,
-            target_name=args.target_name,
-        )
-    elif args.mode == "from-api":
-        prepare_from_api(
-            baseline_build=args.baseline_build,
-            target_build_id=args.target_build_id,
-            target_hash=args.target_hash,
-            classifier=args.classifier,
-            target_name=args.target_name,
-        )
-    else:
-        raise SystemExit(f"Unknown mode: {args.mode}")
+    baseline = _build_spec(args, "baseline")
+    target   = _build_spec(args, "target")
+    prepare(baseline, target, args.classifier)
 
 
 if __name__ == "__main__":

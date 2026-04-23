@@ -43,10 +43,28 @@ apps/triage/submit.py   →  validates results.json against schema,
                              (or --no-upsert for PoC / inspection)
 ```
 
-Input modes (from `prepare.py`):
-- `from-db` (implemented) — both builds from `caseresult_analytical`; joins on `case_id`.
-- `from-csv` (implemented) — baseline from DB, target from a Testray CSV export; joins on `(Case Name, Component)` since the CSV has no `case_id`. Dev supplies `--target-build-id` and `--target-hash` manually.
-- `from-api` (implemented) — baseline from DB, target fetched live from Testray REST (OAuth2 client_credentials). Joins on `case_id`. **Known gap:** `linked_issues` is null in API mode — the Jira reference isn't a direct field on the caseresult object, so the `jira:` line is absent from per-failure sections in `prompt.md`. Classification still works but without Jira context; fall back to `from-db` or `from-csv` if Jira matters. `prepare.py` prints this warning at runtime.
+Source selection (from `prepare.py`): each side (baseline, target)
+independently picks `--{side}-source` from:
+- `db` — read `caseresult_analytical`. Joins on `case_id` when the other
+  side has one; on `(case_name, component_name)` otherwise.
+- `csv` — Testray CSV export. Requires `--{side}-csv` and `--{side}-hash`.
+  CSVs have no `case_id`, so the join falls back to `(Case Name, Component)`.
+- `api` — live Testray REST (OAuth2 client_credentials; needs
+  `testray.client_id` / `testray.client_secret` in `config.yml`). API
+  responses have `case_id` but lack `case_name` / `component_name`.
+  `--{side}-hash` is optional if the build is in `dim_build`, required
+  otherwise.
+
+**Known `api` gap:** `linked_issues` is null for api sides — the Jira
+reference isn't a direct field on the caseresult object, so the `jira:`
+line is absent from per-failure sections in `prompt.md`. Classification
+still works but without Jira context; fall back to a `db` or `csv`
+source if Jira matters. `prepare.py` prints this warning at runtime.
+
+**Unsupported combo:** `csv × api` in either direction. CSV carries
+names but no `case_id`; API carries `case_id` but no names — no common
+join key. `prepare.py` hard-errors with a PoC message. Workarounds: use
+`db` on at least one side, or the same source on both sides.
 
 ## Classification rubric
 
@@ -131,7 +149,8 @@ head-to-head comparison.
 
 ```yaml
 run_id:           r_20260422T062415Z_451312408_462975400
-input_mode:       from-db
+baseline_source:  db
+target_source:    db
 classifier:       agent:claude-opus-4-7
 build_id_a:       451312408
 build_id_b:       462975400
@@ -187,8 +206,20 @@ of `results[]` to have `testray_case_id`, `classification`, `confidence`,
 ## Command cheat sheet
 
 ```bash
-# 1. Prepare the bundle
-python3 -m apps.triage.prepare from-db --build-a 451312408 --build-b 462975400
+# 1. Prepare the bundle (db × db — historical PoC case)
+python3 -m apps.triage.prepare \
+    --baseline-source db --baseline-build-id 451312408 \
+    --target-source   db --target-build-id   462975400
+
+# Other common combos:
+#   DB baseline, CSV target:
+#     --baseline-source db  --baseline-build-id <A> \
+#     --target-source   csv --target-build-id   <B> \
+#     --target-csv <path> --target-hash <sha>
+#   DB baseline, API target:
+#     --baseline-source db  --baseline-build-id <A> \
+#     --target-source   api --target-build-id   <B>
+#   Fully detached (no local DB): --baseline-source api … --target-source api …
 
 # 2. Classify inside your own Claude Code session
 #    (read runs/r_<id>/prompt.md, write runs/r_<id>/results.json)

@@ -196,44 +196,64 @@ Check whether the target is in `dim_build`:
 psql -c "SELECT build_id, build_name, git_hash FROM dim_build WHERE build_id = <id>;"
 ```
 
-### 8b. Pick the input mode based on whether target is in the dump
+### 8b. Pick the source for each side
 
-**If target IS in dim_build** → use `from-db`:
+Each side (baseline, target) independently picks a source: `db`
+(`testray_analytical`), `csv` (Testray CSV export), or `api` (Testray
+REST, OAuth2 client_credentials).
+
+**If both builds are in dim_build** → both sides `db`:
 
 ```bash
-python3 -m apps.triage.prepare from-db \
-    --build-a <baseline-id> \
-    --build-b <target-id>
+python3 -m apps.triage.prepare \
+    --baseline-source db --baseline-build-id <baseline-id> \
+    --target-source   db --target-build-id   <target-id>
 ```
 
-**If target is NOT in dim_build** → two options:
+**If target is NOT in dim_build** → keep baseline on `db`, pick `csv` or
+`api` for the target:
 
-*(a) `from-csv` — dev downloads the target build's case results CSV from
-Testray and points `prepare` at it:*
+*(a) target from CSV — dev downloads the target build's case results CSV
+from Testray:*
 - Path to the CSV (e.g. `~/Downloads/case_results.csv`)
 - Target `build_id` (from the Testray UI)
 - Target `git_hash` (from the Testray build page — 40-char sha from liferay-portal master)
 
 ```bash
-python3 -m apps.triage.prepare from-csv \
-    --baseline-build <baseline-id> \
-    --target-csv <csv-path> \
-    --target-build-id <id> \
-    --target-hash <sha>
+python3 -m apps.triage.prepare \
+    --baseline-source db  --baseline-build-id <baseline-id> \
+    --target-source   csv --target-build-id   <target-id> \
+        --target-csv <csv-path> --target-hash <sha>
 ```
 
-*(b) `from-api` — fetch directly from Testray REST. Requires the dev to
-add `testray.client_id` and `testray.client_secret` to `config.yml`
-(ask them if they have these; if not, fall back to `from-csv`).*
+*(b) target from Testray REST — requires the dev to add
+`testray.client_id` and `testray.client_secret` to `config.yml` (ask
+them if they have these; if not, fall back to CSV).*
 
 ```bash
-python3 -m apps.triage.prepare from-api \
-    --baseline-build <baseline-id> \
-    --target-build-id <id> \
-    --target-hash <sha>
+python3 -m apps.triage.prepare \
+    --baseline-source db  --baseline-build-id <baseline-id> \
+    --target-source   api --target-build-id   <target-id>
+# --target-hash is optional if the target is in dim_build; required otherwise.
 ```
 
-Either way, you'll get:
+**If neither build is in dim_build** (dump far behind) → fully detached,
+both sides `api`:
+
+```bash
+python3 -m apps.triage.prepare \
+    --baseline-source api --baseline-build-id <baseline-id> --baseline-hash <sha> \
+    --target-source   api --target-build-id   <target-id>   --target-hash   <sha>
+```
+
+**Not supported today:** mixing `csv` and `api` in the same run (either
+direction). CSV and API are lossy in different dimensions — CSV has
+`(case_name, component)` but no `case_id`, API has `case_id` but no
+names, and they can't be joined. `prepare.py` hard-errors with a clear
+message if you try. Fall back to `db` on at least one side, or use the
+same source on both sides.
+
+You'll get:
 
 ```
 Run bundle ready: apps/triage/runs/r_<ts>_<A>_<B>
