@@ -13,7 +13,8 @@ function onOpen() {
 }
 
 function recalculateAllMetrics() {
-  propagateCITags(); // <-- Stamps the sheets first!
+  autoFlagCIBuildsInTimeline(); // <-- Stamp CI based on build name first
+  propagateCITags(); // <-- Then propagate into Stable_fetch / Stable_failedTests
   updateTestMetrics();
   updateWeeklyMetrics();
   updateWeeklyBuildPassRate();
@@ -171,6 +172,7 @@ function fetchStableData() {
   }
 
   updateStableTimeline();
+  autoFlagCIBuildsInTimeline();
   fetchFailedTests(accessToken);
 }
 
@@ -230,9 +232,58 @@ function updateStableTimeline() {
     const startRow = timelineTab.getLastRow() + 1;
     const range = timelineTab.getRange(startRow, 1, timelineRows.length, 7);
     range.setValues(timelineRows);
-    
+
     timelineTab.getRange(startRow, 5, timelineRows.length, 1).setNumberFormat("yyyy-MM-dd");
     timelineTab.getRange(startRow, 6, timelineRows.length, 1).setNumberFormat("0.0000");
+  }
+}
+
+function autoFlagCIBuildsInTimeline() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const fetchTab = ss.getSheetByName("Stable_fetch");
+  const timelineTab = ss.getSheetByName("Stable_timeline");
+
+  if (!fetchTab || !timelineTab) return;
+
+  const fetchLastRow = fetchTab.getLastRow();
+  const timelineLastRow = timelineTab.getLastRow();
+  if (fetchLastRow < 2 || timelineLastRow < 2) return;
+
+  // Build set of buildIDs whose Stable_fetch name (col C) contains "PR" or "Acceptance"
+  const fetchRows = fetchTab.getRange(2, 2, fetchLastRow - 1, 2).getValues(); // cols B, C
+  const ciBuildIDs = new Set();
+
+  fetchRows.forEach(row => {
+    const buildID = row[0];
+    const buildName = row[1] ? row[1].toString() : "";
+    if (!buildID) return;
+    if (buildName.indexOf("PR") !== -1 || buildName.indexOf("Acceptance") !== -1) {
+      ciBuildIDs.add(buildID.toString());
+    }
+  });
+
+  if (ciBuildIDs.size === 0) return;
+
+  // Read Stable_timeline buildID (col B) and Comment (col G); cols B..G = 6 cols
+  const timelineRows = timelineTab.getRange(2, 2, timelineLastRow - 1, 6).getValues();
+  const newComments = [];
+  let changed = 0;
+
+  timelineRows.forEach(row => {
+    const buildID = row[0];
+    const currentComment = row[5];
+    if (buildID && ciBuildIDs.has(buildID.toString()) && currentComment !== "CI") {
+      newComments.push(["CI"]);
+      changed++;
+    } else {
+      newComments.push([currentComment]);
+    }
+  });
+
+  timelineTab.getRange(2, 7, newComments.length, 1).setValues(newComments);
+
+  if (changed > 0) {
+    ss.toast(`Flagged ${changed} CI build(s) in Stable_timeline.`, '✅ CI Auto-Tagged');
   }
 }
 
