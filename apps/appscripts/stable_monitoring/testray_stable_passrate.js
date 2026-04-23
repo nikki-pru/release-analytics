@@ -16,6 +16,7 @@ function recalculateAllMetrics() {
   propagateCITags(); // <-- Stamps the sheets first!
   updateTestMetrics();
   updateWeeklyMetrics();
+  updateWeeklyBuildPassRate();
   SpreadsheetApp.getActiveSpreadsheet().toast('Metrics recalculated and CI tags propagated!', '✅ Done');
 }
 
@@ -359,6 +360,7 @@ function fetchFailedTests(token) {
   // Trigger metrics calculations automatically at the end!
   updateTestMetrics();
   updateWeeklyMetrics();
+  updateWeeklyBuildPassRate();
 }
 
 function updateTestMetrics() {
@@ -558,11 +560,80 @@ function updateWeeklyMetrics() {
   }
 
   // 4. Write data to the Sheet
-  weeklyTab.clear(); 
+  weeklyTab.clear();
   if (outputRows.length > 1) {
     weeklyTab.getRange(1, 1, outputRows.length, 5).setValues(outputRows);
     weeklyTab.getRange(2, 2, outputRows.length - 1, 1).setNumberFormat("yyyy-MM-dd");
     weeklyTab.getRange(2, 5, outputRows.length - 1, 1).setNumberFormat("0.0000");
+  }
+}
+
+function updateWeeklyBuildPassRate() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const fetchTab = ss.getSheetByName("Stable_fetch");
+
+  let buildRateTab = ss.getSheetByName("Stable_weeklyBuildPassRate");
+  if (!buildRateTab) {
+    buildRateTab = ss.insertSheet("Stable_weeklyBuildPassRate");
+  }
+
+  const ignoredBuilds = getIgnoredBuilds(ss);
+
+  function getMonday(dateRaw) {
+    const d = new Date(dateRaw);
+    const day = d.getDay();
+    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+    const monday = new Date(d.setDate(diff));
+    monday.setHours(0,0,0,0);
+    return Utilities.formatDate(monday, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+
+  const fetchLastRow = fetchTab.getLastRow();
+  if (fetchLastRow < 2) {
+    buildRateTab.clear();
+    return;
+  }
+
+  // Pull through column P (PassRate, index 15)
+  const fetchData = fetchTab.getRange(2, 1, fetchLastRow - 1, 16).getValues();
+
+  let weeklyStats = {};
+
+  fetchData.forEach(row => {
+    const buildID = row[1];
+    const buildDateRaw = row[5];
+    const passRate = row[15];
+
+    if (!buildID || !buildDateRaw || ignoredBuilds.has(buildID.toString())) return;
+
+    const weekString = getMonday(buildDateRaw);
+    if (!weeklyStats[weekString]) {
+      weeklyStats[weekString] = { total: new Set(), failed: new Set() };
+    }
+
+    weeklyStats[weekString].total.add(buildID);
+    if (passRate < 1) {
+      weeklyStats[weekString].failed.add(buildID);
+    }
+  });
+
+  let outputRows = [];
+  outputRows.push(["Week Start Date", "Failed Builds", "Total Builds", "Pass Rate"]);
+
+  Object.keys(weeklyStats).sort().forEach(weekString => {
+    const stats = weeklyStats[weekString];
+    const total = stats.total.size;
+    const failed = stats.failed.size;
+    const passed = total - failed;
+    const passRate = total > 0 ? passed / total : 0;
+    outputRows.push([weekString, failed, total, passRate]);
+  });
+
+  buildRateTab.clear();
+  if (outputRows.length > 1) {
+    buildRateTab.getRange(1, 1, outputRows.length, 4).setValues(outputRows);
+    buildRateTab.getRange(2, 1, outputRows.length - 1, 1).setNumberFormat("yyyy-MM-dd");
+    buildRateTab.getRange(2, 4, outputRows.length - 1, 1).setNumberFormat("0.0000");
   }
 }
 
