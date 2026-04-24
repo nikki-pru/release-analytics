@@ -488,6 +488,15 @@ releases:
     release_date:     ""
     is_major_release: false
     is_lts:           false
+    status:           RELEASED
+    notes:            ""
+    
+  - label:            "U149"
+    quarter_label:    "2026.Q2"
+    git_tag:          "7.4.13-u149"
+    release_date:     ""
+    is_major_release: false
+    is_lts:           false
     status:           IN_DEVELOPMENT
     notes:            ""
 
