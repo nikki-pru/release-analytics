@@ -11,6 +11,10 @@ The comparison joins rows on testray_case_id and reports:
     - confusion matrix (BUG / NEEDS_REVIEW / FALSE_POSITIVE / AUTO_CLASSIFIED)
     - culprit_file agreement on shared BUG rows
     - rows present in one classifier but missing from the other
+    - subtask-level rollup: when either classifier ran in --by-subtask mode
+      and populated `subtask_id`, group case-rows by subtask and check
+      cross-classifier agreement at the subtask grain (one verdict per
+      subtask is what tickets get filed against).
 
 Usage:
     python3 -m apps.triage.compare_classifiers \\
@@ -52,13 +56,13 @@ def fetch_pair(
     sql = f"""
         WITH a AS (
             SELECT build_id_b, testray_case_id, test_case, component_name,
-                   classification, reason
+                   classification, reason, subtask_id
             FROM fact_triage_results
             WHERE classifier = %s
         ),
         b AS (
             SELECT build_id_b, testray_case_id, test_case, component_name,
-                   classification, reason
+                   classification, reason, subtask_id
             FROM fact_triage_results
             WHERE classifier = %s
         )
@@ -70,7 +74,9 @@ def fetch_pair(
             a.classification AS classification_a,
             b.classification AS classification_b,
             a.reason         AS reason_a,
-            b.reason         AS reason_b
+            b.reason         AS reason_b,
+            a.subtask_id     AS subtask_id_a,
+            b.subtask_id     AS subtask_id_b
         FROM a
         FULL OUTER JOIN b USING (build_id_b, testray_case_id)
         {filter_sql.replace("a.build_id_b", "COALESCE(a.build_id_b, b.build_id_b)")}
@@ -186,6 +192,80 @@ def report(df: pd.DataFrame, classifier_a: str, classifier_b: str) -> None:
         if not only_b.empty:
             cls_b = only_b["classification_b"].value_counts().to_dict()
             print(f"  Only in {classifier_b}: {len(only_b)} ({cls_b})")
+
+    _subtask_rollup(both, classifier_a, classifier_b)
+
+
+def _subtask_rollup(both: pd.DataFrame, classifier_a: str, classifier_b: str) -> None:
+    """Subtask-level rollup. Skipped when neither side has subtask_ids
+    (both classifiers ran per-test on builds without testflow). When either
+    side ran in --by-subtask mode, members of the same subtask_id should
+    all share one verdict — flag any that don't (sign of a stale row from
+    a different mode/run sneaking through). Then report cross-classifier
+    agreement at the subtask grain."""
+    if "subtask_id_a" not in both.columns and "subtask_id_b" not in both.columns:
+        return
+
+    has_a = both["subtask_id_a"].notna().any()
+    has_b = both["subtask_id_b"].notna().any()
+    if not has_a and not has_b:
+        return
+
+    print("\nSubtask rollup")
+    print("--------------")
+
+    def _summarize(side_df: pd.DataFrame, sid_col: str, cls_col: str, label: str) -> dict:
+        """Return {sid: {verdicts: Counter, mixed: bool, dominant: str}}."""
+        view = side_df[side_df[sid_col].notna()]
+        if view.empty:
+            print(f"  {label}: no subtask_id populated (per-test mode)")
+            return {}
+        groups = view.groupby(sid_col)[cls_col].apply(list).to_dict()
+        rolled: dict[int, dict] = {}
+        mixed_count = 0
+        for sid, verdicts in groups.items():
+            ctr = Counter(verdicts)
+            mixed = len(ctr) > 1
+            if mixed:
+                mixed_count += 1
+            rolled[int(sid)] = {
+                "verdicts": ctr,
+                "mixed":    mixed,
+                "dominant": ctr.most_common(1)[0][0],
+            }
+        sizes = [sum(d["verdicts"].values()) for d in rolled.values()]
+        median = sorted(sizes)[len(sizes) // 2] if sizes else 0
+        verdict_counts = Counter(d["dominant"] for d in rolled.values())
+        print(f"  {label}: {len(rolled)} subtasks covering {sum(sizes)} case-rows "
+              f"(median {median} cases/subtask)")
+        for v, n in sorted(verdict_counts.items(), key=lambda x: -x[1]):
+            print(f"      {v:<16} {n}")
+        if mixed_count:
+            print(f"      mixed-verdict subtasks: {mixed_count} "
+                  f"(unexpected — fan-out should produce one verdict per subtask)")
+        return rolled
+
+    rolled_a = _summarize(both, "subtask_id_a", "classification_a", classifier_a)
+    rolled_b = _summarize(both, "subtask_id_b", "classification_b", classifier_b)
+
+    # Cross-classifier subtask agreement when both sides have subtask_ids
+    shared_sids = set(rolled_a) & set(rolled_b)
+    if shared_sids:
+        agree = sum(1 for s in shared_sids
+                    if rolled_a[s]["dominant"] == rolled_b[s]["dominant"])
+        pct = 100 * agree / len(shared_sids)
+        print(f"\n  Shared subtask_ids: {len(shared_sids)}")
+        print(f"  Subtask-level agreement: {agree}/{len(shared_sids)} ({pct:.1f}%)")
+        # Top disagreement pairs at subtask grain
+        disagreement = Counter()
+        for s in shared_sids:
+            va, vb = rolled_a[s]["dominant"], rolled_b[s]["dominant"]
+            if va != vb:
+                disagreement[(va, vb)] += 1
+        if disagreement:
+            print("  Top subtask-level disagreements:")
+            for (va, vb), n in disagreement.most_common(5):
+                print(f"    {va:>15} → {vb:<15}  {n}")
 
 
 # ---------------------------------------------------------------------------
