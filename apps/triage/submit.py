@@ -32,6 +32,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from apps.triage.render_html import render_run
 from apps.triage.store import (
     ensure_schema, ensure_run_log, upsert_triage_results, log_run,
 )
@@ -482,6 +483,9 @@ def main() -> None:
         print(f"Subtask fan-out: {n_subtasks} subtask verdicts → "
               f"{n_with_sid} case-rows carry subtask_id "
               f"(remaining {len(df) - n_with_sid} are unmapped/auto/missing)")
+
+    report_path = render_run(run_dir)
+    print(f"Report:     {report_path}")
 
     if args.no_upsert:
         print("\n--no-upsert set → not writing to fact_triage_results / triage_run_log.")
