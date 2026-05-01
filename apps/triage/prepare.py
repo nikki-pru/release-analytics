@@ -98,6 +98,13 @@ GIT_DIFF_EXCLUDES = [
     ":!cloud/**",
 ]
 
+# Commit subjects matching these patterns are bot-generated module-version
+# bumps (artifact:ignore X Y.Z.W ...) or per-module "prep next" tags. They
+# pollute the cluster section without being plausible root-cause candidates.
+def _is_noise_commit_subject(subj: str) -> bool:
+    s = subj.strip()
+    return s.startswith("artifact:ignore") or "prep next" in s
+
 
 # ---------------------------------------------------------------------------
 # Side specification
@@ -1189,6 +1196,8 @@ def fetch_commits_in_range(git_repo: Path, hash_a: str, hash_b: str) -> list[tup
     for line in out.splitlines():
         if "\t" in line:
             h, subj = line.split("\t", 1)
+            if _is_noise_commit_subject(subj):
+                continue
             commits.append((h, subj))
     return commits
 
