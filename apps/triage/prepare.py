@@ -212,8 +212,10 @@ def _testray_oauth_token(cfg: dict) -> str:
 def _testray_fetch_paginated(
     endpoint: str, params: dict, token: str, base_url: str,
     page_size: int = 500, sleep_between: float = 0.3,
+    progress_label: str | None = None,
 ) -> list[dict]:
-    """Follow Liferay Objects pagination until lastPage."""
+    """Follow Liferay Objects pagination until lastPage. When `progress_label`
+    is set, prints one stderr line per page so long fetches don't look hung."""
     base = base_url.rstrip("/")
     items: list[dict] = []
     page = 1
@@ -234,6 +236,12 @@ def _testray_fetch_paginated(
             raise
         items.extend(data.get("items", []))
         last_page = data.get("lastPage", 1)
+        if progress_label:
+            print(
+                f"   [{progress_label}] page {page}/{last_page} "
+                f"({len(items)} rows so far)",
+                file=sys.stderr, flush=True,
+            )
         if page >= last_page:
             break
         page += 1
@@ -256,8 +264,12 @@ def fetch_case_metadata(case_ids: list[int], cfg: dict) -> dict[int, dict]:
         return {}
     token = _testray_oauth_token(cfg)
     base = cfg["base_url"].rstrip("/")
+    total = len(case_ids)
+    step = max(1, total // 10)  # ~10 progress lines for any total
+    print(f"   [case metadata] fetching {total} case(s) …",
+          file=sys.stderr, flush=True)
     out: dict[int, dict] = {}
-    for cid in case_ids:
+    for i, cid in enumerate(case_ids, start=1):
         url = f"{base}/o/c/cases/{cid}"
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {token}"},
@@ -277,6 +289,9 @@ def fetch_case_metadata(case_ids: list[int], cfg: dict) -> dict[int, dict]:
             "flaky":        str(body.get("flaky")).lower() == "true",
             "component_id": int(comp_id) if comp_id else None,
         }
+        if i % step == 0 or i == total:
+            print(f"   [case metadata] {i}/{total}",
+                  file=sys.stderr, flush=True)
         time.sleep(0.05)
     return out
 
@@ -289,8 +304,12 @@ def fetch_component_metadata(component_ids: list[int], cfg: dict) -> dict[int, s
         return {}
     token = _testray_oauth_token(cfg)
     base = cfg["base_url"].rstrip("/")
+    total = len(component_ids)
+    step = max(1, total // 10)
+    print(f"   [component metadata] fetching {total} component(s) …",
+          file=sys.stderr, flush=True)
     out: dict[int, str] = {}
-    for cid in component_ids:
+    for i, cid in enumerate(component_ids, start=1):
         url = f"{base}/o/c/components/{cid}"
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {token}"},
@@ -307,6 +326,9 @@ def fetch_component_metadata(component_ids: list[int], cfg: dict) -> dict[int, s
         name = body.get("name")
         if name:
             out[int(cid)] = name
+        if i % step == 0 or i == total:
+            print(f"   [component metadata] {i}/{total}",
+                  file=sys.stderr, flush=True)
         time.sleep(0.05)
     return out
 
@@ -431,6 +453,7 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
                       "r_teamToCaseResult_c_teamId",
         },
         token=token, base_url=cfg["base_url"],
+        progress_label=f"caseresults build {build_id}",
     )
     if not items:
         return pd.DataFrame()
