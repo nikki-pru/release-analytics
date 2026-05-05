@@ -22,8 +22,15 @@ log_info("=== load_lizard.R started ===")
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-cfg         <- yaml::read_yaml("config/config.yml")
-lizard_path <- "data/lizard_output_20250323.csv"
+cfg <- yaml::read_yaml("config/config.yml")
+
+lizard_files <- sort(Sys.glob("data/lizard_output_*.csv"), decreasing = TRUE)
+if (length(lizard_files) == 0) {
+  log_error("No data/lizard_output_*.csv found — run lizard CLI first (see README)")
+  stop("No data/lizard_output_*.csv found")
+}
+lizard_path <- lizard_files[[1]]
+log_info("Selected lizard file: {lizard_path}")
 
 con <- dbConnect(
   RPostgres::Postgres(),
