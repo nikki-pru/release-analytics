@@ -19,6 +19,7 @@ Usage:
 import argparse
 import html
 import json
+import re
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
@@ -28,8 +29,61 @@ import yaml
 from apps.triage.prepare import (
     _testray_fetch_paginated,
     _testray_oauth_token,
+    fetch_commits_in_range,
     load_config,
 )
+
+
+_TICKET_RE = re.compile(r'\b((?:LPD|LPP|LPS)-\d+)\b')
+
+
+def _build_ticket_commit_map(
+    repo_path: str | None, hash_a: str | None, hash_b: str | None,
+) -> dict[str, list[tuple[str, str]]]:
+    """Parse `git log hash_a..hash_b` and return {ticket: [(short_sha, subject), ...]}.
+
+    Empty dict if any input is missing or the lookup fails — annotation is
+    purely additive, the rest of the report still renders without it."""
+    if not (repo_path and hash_a and hash_b):
+        return {}
+    try:
+        commits = fetch_commits_in_range(
+            Path(repo_path).expanduser(), hash_a, hash_b,
+        )
+    except Exception:
+        return {}
+    out: dict[str, list[tuple[str, str]]] = {}
+    for sha, subject in commits:
+        for ticket in _TICKET_RE.findall(subject or ""):
+            out.setdefault(ticket, []).append((sha, subject))
+    return out
+
+
+def _commits_for_text(text: str,
+                      ticket_map: dict[str, list[tuple[str, str]]]) -> str:
+    """Find LPD/LPP/LPS tickets in `text` and return a one-line summary of
+    matching commits, e.g. 'LPD-86166 → 70fdac5208b61 Disable button…'.
+    Empty string if no tickets cited or no commits matched."""
+    if not text or not ticket_map:
+        return ""
+    seen: set[str] = set()
+    parts: list[str] = []
+    for ticket in _TICKET_RE.findall(text):
+        if ticket in seen:
+            continue
+        seen.add(ticket)
+        commits = ticket_map.get(ticket, [])
+        if not commits:
+            continue
+        if len(commits) == 1:
+            sha, subj = commits[0]
+            short_subj = (subj or "")[:80]
+            parts.append(f"{ticket} → {sha} {short_subj}".rstrip())
+        else:
+            shas = ", ".join(sha for sha, _ in commits[:3])
+            tail = f" +{len(commits) - 3}" if len(commits) > 3 else ""
+            parts.append(f"{ticket} → {len(commits)} commits ({shas}{tail})")
+    return "; ".join(parts)
 
 
 _VERDICT_CLASS = {
@@ -260,7 +314,21 @@ _SORT_JS = """
       th.appendChild(ind);
       th.addEventListener('click', function () {
         var tbody = table.querySelector('tbody');
-        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        // Sort by parent rows (case-row, or every row if no inline details)
+        // and keep each row's adjacent case-detail row glued to it during
+        // re-append, so click-to-expand stays anchored to the right parent.
+        var allRows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        var groups = [];
+        for (var i = 0; i < allRows.length; i++) {
+          var row = allRows[i];
+          if (row.classList.contains('case-detail')) continue;
+          var group = [row];
+          var nxt = allRows[i + 1];
+          if (nxt && nxt.classList.contains('case-detail')) {
+            group.push(nxt);
+          }
+          groups.push(group);
+        }
         var asc = !th.classList.contains('asc');
         ths.forEach(function (h) {
           h.classList.remove('sorted', 'asc', 'desc');
@@ -268,12 +336,14 @@ _SORT_JS = """
         });
         th.classList.add('sorted', asc ? 'asc' : 'desc');
         ind.textContent = asc ? '▲' : '▼';
-        rows.sort(function (r1, r2) {
-          var k1 = cellKey(r1.children[idx]);
-          var k2 = cellKey(r2.children[idx]);
+        groups.sort(function (g1, g2) {
+          var k1 = cellKey(g1[0].children[idx]);
+          var k2 = cellKey(g2[0].children[idx]);
           return asc ? cmp(k1, k2) : cmp(k2, k1);
         });
-        rows.forEach(function (r) { tbody.appendChild(r); });
+        groups.forEach(function (g) {
+          g.forEach(function (r) { tbody.appendChild(r); });
+        });
       });
     });
   });
@@ -299,10 +369,12 @@ def _status_class(s: str) -> str:
 def _status_pair(a, b) -> str:
     a_s = _esc(a) or "—"
     b_s = _esc(b) or "—"
+    # Real whitespace between the spans so the browser wraps at the space
+    # instead of breaking mid-word ('FAILED' → 'F\nailed').
     return (
         f'<span class="status">'
-        f'<span class="{_status_class(a_s)}">{a_s}</span>'
-        f'<span class="arrow">→</span>'
+        f'<span class="{_status_class(a_s)}">{a_s}</span> '
+        f'<span class="arrow">→</span> '
         f'<span class="{_status_class(b_s)}">{b_s}</span>'
         f'</span>'
     )
@@ -683,13 +755,45 @@ _TESTRAY_SUBTASK_URL = (
     "https://testray.liferay.com/web/testray#/testflow/{flow}/subtasks/{sid}"
 )
 
-# liferay-portal project on testray.liferay.com — used to build per-case-result
-# deep-links. Hardcoded; the renderer doesn't have other places to learn it.
-_LRP_PROJECT_ID = 35392
+# Testray case-result deep-link. project + routine are hardcoded to the
+# liferay-portal release-2026.q1 routine — api×api runs don't carry
+# routine_id from dim_build, so deriving it dynamically isn't reliable.
+# Update if a different routine becomes the default. The path segment is
+# `case-result/{result_id}` (the case-result id from
+# /o/testray-rest/v1.0/testray-case-result, not the test case id).
 _TESTRAY_CASE_RESULT_URL = (
-    "https://testray.liferay.com/web/testray#/project/{project}"
-    "/routines/{routine}/build/{build}/case-result/{result_id}"
+    "https://testray.liferay.com/#/project/456316917"
+    "/routines/456327753/build/{build}/case-result/{result_id}"
 )
+_TESTRAY_BUILD_URL = (
+    "https://testray.liferay.com/web/testray#/project/456316917"
+    "/routines/456327753/build/{build}"
+)
+
+# Stub Jira create link. Today this just opens the blank Create Issue dialog;
+# future iteration should prefill summary/description from each row's
+# verdict + suspicious commits + reasoning via Jira's `?summary=…&description=…`
+# query params (or via the REST API for a full templated body).
+_JIRA_CREATE_URL = "https://liferay.atlassian.net/secure/CreateIssue!default.jspa"
+
+
+def _fetch_build_name(build_id: int, cfg: dict) -> str | None:
+    """Look up a build's `name` via /o/c/builds/{id}. Returns None on any
+    failure so the caller can fall back to displaying the raw id."""
+    import urllib.request
+    base = cfg["base_url"].rstrip("/")
+    url = f"{base}/o/c/builds/{build_id}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {_testray_oauth_token(cfg)}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    name = data.get("name") if isinstance(data, dict) else None
+    return name or None
 
 
 def _fetch_caseresult_meta(build_id: int, cfg: dict) -> dict[str, dict]:
@@ -753,7 +857,8 @@ def _load_cluster_per_test(run_dir: Path) -> dict[str, dict[str, str]]:
 def _build_per_test_rows(diff_list: pd.DataFrame,
                          results: list[dict],
                          api_meta: dict[str, dict],
-                         cluster_map: dict[str, dict[str, str]]) -> list[dict]:
+                         cluster_map: dict[str, dict[str, str]],
+                         ticket_map: dict[str, list[tuple[str, str]]] | None = None) -> list[dict]:
     """One render row per test case in diff_list.csv.
 
     Verdicts come from results.json. If results are keyed on subtask_id (the
@@ -787,6 +892,7 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
         sid_int = int(sid) if pd.notna(sid) and sid else None
 
         pre = row.get("pre_classification")
+        specific_change = ""
         if pd.notna(pre) and pre:
             verdict, conf = "AUTO_CLASSIFIED", "auto"
             reason = f"pre_classification={pre}"
@@ -796,6 +902,7 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
                 verdict = r["classification"]
                 conf = r.get("confidence") or ""
                 reason = r.get("reason") or ""
+                specific_change = r.get("specific_change") or ""
             else:
                 verdict, conf = "NEEDS_REVIEW", "low"
                 reason = "No entry in results.json — defaulted to NEEDS_REVIEW"
@@ -803,6 +910,15 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
         test_case = row.get("test_case") or ""
         meta = api_meta.get(test_case, {})
         ann = cluster_map.get(test_case, {})
+        commit_anno = _commits_for_text(
+            f"{reason} {specific_change}", ticket_map or {},
+        )
+        # Suspicious commits column = commit annotation only; reasoning lives
+        # in its own column. If a manual cluster_report.csv supplied an
+        # 'rootCause from diff' value, treat it as the canonical commit
+        # annotation (manual labels win over auto-derived ones).
+        suspicious_commits = ann.get("root_cause_from_diff", "") or commit_anno
+        reasoning = reason
 
         rows.append({
             "case_id":              cid,
@@ -818,62 +934,183 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
             "verdict":              verdict,
             "confidence":           conf,
             "reason":               reason,
-            "root_cause":           ann.get("cluster", ""),
-            "root_cause_from_diff": ann.get("root_cause_from_diff", ""),
+            "suspicious_commits":   suspicious_commits,
+            "reasoning":            reasoning,
         })
     return rows
 
 
+def _per_test_detail_inner(r: dict,
+                           routine_id: str | int | None,
+                           build_id: str | int | None,
+                           compare_meta: dict[str, dict] | None = None,
+                           compare_label: str = "master") -> str:
+    """Inline detail content shown when the user expands a row. Verdict,
+    confidence, Testray link, component, team are already on the parent row
+    so they're omitted here to keep the panel focused on per-failure detail
+    (status, ticket, error, root-cause analysis)."""
+    items = [
+        ("Ticket already linked", _esc(r["linked_issues"]) or "—"),
+        ("Status",                _status_pair(r["status_a"], r["status_b"])),
+        ("Subtask",               f'<code>{r["subtask_id"]}</code>' if r["subtask_id"] else ""),
+        ("Error",                 _err_html(r["error_message"])),
+        ("Suspicious commits",    _esc(r["suspicious_commits"])),
+        ("Reasoning",             _esc(r["reasoning"])),
+    ]
+    if compare_meta is not None:
+        cell_html, _ = _compare_cell(r, compare_meta, compare_label)
+        items.append((f"Also failing in {compare_label}", cell_html or "—"))
+    return _detail_dl(items)
+
+
+_BAD_STATUSES = {"FAILED", "BLOCKED", "UNTESTED", "TESTFIX"}
+
+
+def _compare_cell(r: dict, compare_meta: dict[str, dict] | None,
+                  compare_label: str) -> tuple[str, str]:
+    """Returns (cell_html, data_attr_value) for the compare column.
+    data_attr_value is one of yes / no / missing — used so the column can be
+    filtered/styled later. Cell shows status text and a tick or dash."""
+    if compare_meta is None:
+        return "", ""
+    name = r.get("test_case") or ""
+    m = compare_meta.get(name)
+    if m is None:
+        return f'<span class="cmp cmp-missing" title="Not found in {_esc(compare_label)} build">—</span>', "missing"
+    status = (m.get("status") or "").upper()
+    if status in _BAD_STATUSES:
+        return (
+            f'<span class="cmp cmp-yes" title="status in {_esc(compare_label)} build: {_esc(status)}">'
+            f'Yes ({_esc(status)})</span>',
+            "yes",
+        )
+    return (
+        f'<span class="cmp cmp-no" title="status in {_esc(compare_label)} build: {_esc(status)}">'
+        f'No ({_esc(status)})</span>',
+        "no",
+    )
+
+
 def _render_per_test_table(rows: list[dict],
                            routine_id: str | int | None,
-                           build_id: str | int | None) -> str:
+                           build_id: str | int | None,
+                           compare_meta: dict[str, dict] | None = None,
+                           compare_build_id: str | int | None = None,
+                           compare_label: str = "master") -> str:
     cols = [
-        ("#",                    "col-idx"),
-        ("Test",                 "col-test"),
-        ("Testray",              "col-link"),
-        ("Component",            "col-comp"),
-        ("Team",                 "col-team"),
-        ("Ticket",               "col-ticket"),
-        ("Status",               "col-status"),
-        ("Verdict",              "col-verdict"),
-        ("Root cause",           "col-rc"),
-        ("Root cause from diff", "col-rcd"),
+        ("#",                  "col-idx",        ""),
+        ("Test",               "col-test",
+         "Click the test name to open its Testray case-result page."),
+        ("Component",          "col-comp",       ""),
+        ("Team",               "col-team",       ""),
+        ("Status",             "col-status",     ""),
+        ("Verdict",            "col-verdict",    ""),
+        ("Confidence",         "col-confidence",
+         "Classifier confidence: high / medium / low / auto."),
     ]
+    if compare_meta is not None:
+        compare_hint = (
+            f"Cross-reference against build {compare_build_id} "
+            f"({compare_label}). Yes = the same test case is also FAILED / "
+            f"BLOCKED / UNTESTED / TESTFIX in that build, suggesting the "
+            f"failure is not specific to this build pair."
+        )
+        build_url = _TESTRAY_BUILD_URL.format(build=compare_build_id)
+        compare_header_html = (
+            f'<span class="cmp-header-label">Also failing in '
+            f'{_esc(compare_label)}</span>'
+            f'<a class="cmp-header-link" href="{build_url}" target="_blank" '
+            f'rel="noopener" title="Open build {compare_build_id} in Testray">'
+            f'({_esc(str(compare_build_id))})</a>'
+        )
+        cols.append((compare_header_html, "col-compare", compare_hint))
+    cols += [
+        ("Suspicious commits", "col-suspicious", ""),
+        ("Reasoning",          "col-reasoning",  ""),
+        ("Create Jira ticket", "col-jira",
+         "Stub link — will be mapped in the future to the Jira API "
+         "with a templated ticket body per row."),
+    ]
+    n_cols = len(cols)
     out = ['<table class="per-test-table">', '<thead><tr>']
-    out += [f'<th class="{c}">{h}</th>' for h, c in cols]
+    for h, c, hint in cols:
+        title_attr = f' title="{_esc(hint)}"' if hint else ''
+        # col-compare header carries pre-built HTML (the build deep-link);
+        # everything else is plain text and gets escaped.
+        h_html = h if c == "col-compare" else _esc(h)
+        out.append(f'<th class="{c}"{title_attr}>{h_html}</th>')
     out += ['</tr></thead>', '<tbody>']
     for i, r in enumerate(rows, 1):
         vclass = _VERDICT_CLASS[r["verdict"]]
         comp = _esc(r["component_name"]) or "—"
         team = _esc(r["team_name"]) or "—"
-        tickets = _esc(r["linked_issues"]) or "—"
-        rc = _esc(r["root_cause"]) or "—"
-        rcd = _esc(r["root_cause_from_diff"]) or "—"
-        if r["case_result_id"] and routine_id and build_id:
+        suspicious = _esc(r["suspicious_commits"]) or "—"
+        reasoning = _esc(r["reasoning"]) or "—"
+        test_label = _esc(r["test_case"]) or "—"
+        if r["case_result_id"] and build_id:
             url = _TESTRAY_CASE_RESULT_URL.format(
-                project=_LRP_PROJECT_ID,
-                routine=routine_id,
                 build=build_id,
                 result_id=r["case_result_id"],
             )
-            link_cell = (f'<a href="{url}" target="_blank" rel="noopener">open</a>')
+            test_cell = (
+                f'<a class="test-link" href="{url}" target="_blank" '
+                f'rel="noopener" title="Open in Testray">{test_label}</a>'
+            )
         else:
-            link_cell = "—"
+            test_cell = test_label
+        conf_class = (
+            r["confidence"] if r["confidence"] in ("high", "medium", "low") else ""
+        )
+        conf_cell = (
+            f'<span class="conf {conf_class}">{_esc(r["confidence"])}</span>'
+            if r["confidence"] else "—"
+        )
         team_attr = _esc(r["team_name"]) if r["team_name"] else ""
+        conf_attr = _esc(r["confidence"]) if r["confidence"] else ""
+        compare_cell_html, compare_attr = _compare_cell(
+            r, compare_meta, compare_label,
+        )
+        compare_td = (
+            f'<td class="col-compare">{compare_cell_html}</td>'
+            if compare_meta is not None else ""
+        )
+        compare_attr_html = (
+            f' data-compare="{compare_attr}"' if compare_meta is not None else ""
+        )
         out.append(
-            f'<tr id="case-{r["case_id"]}" data-team="{team_attr}" '
-            f'data-verdict="{r["verdict"]}">'
+            f'<tr id="case-{r["case_id"]}" class="case-row" '
+            f'data-team="{team_attr}" data-verdict="{r["verdict"]}" '
+            f'data-confidence="{conf_attr}"'
+            f'{compare_attr_html}>'
             f'<td class="col-idx col-num">{i}</td>'
-            f'<td class="col-test">{_esc(r["test_case"])}</td>'
-            f'<td class="col-link">{link_cell}</td>'
+            f'<td class="col-test">{test_cell}</td>'
             f'<td class="col-comp">{comp}</td>'
             f'<td class="col-team">{team}</td>'
-            f'<td class="col-ticket">{tickets}</td>'
             f'<td class="col-status">{_status_pair(r["status_a"], r["status_b"])}</td>'
             f'<td class="col-verdict"><span class="verdict {vclass}">{_esc(r["verdict"])}</span></td>'
-            f'<td class="col-rc">{rc}</td>'
-            f'<td class="col-rcd">{rcd}</td>'
+            f'<td class="col-confidence">{conf_cell}</td>'
+            f'{compare_td}'
+            f'<td class="col-suspicious">{suspicious}</td>'
+            f'<td class="col-reasoning">{reasoning}</td>'
+            f'<td class="col-jira">'
+            f'<a class="jira-create" href="{_JIRA_CREATE_URL}" '
+            f'target="_blank" rel="noopener" '
+            f'title="Opens Jira with a blank Create Issue dialog. '
+            f'Future: prefill summary/description from this row.">'
+            f'Create</a>'
+            f'</td>'
             f'</tr>'
+        )
+        # Inline detail row, hidden until the parent row is clicked.
+        out.append(
+            f'<tr class="case-detail {vclass}" id="detail-case-{r["case_id"]}" '
+            f'data-team="{team_attr}" data-verdict="{r["verdict"]}" '
+            f'data-confidence="{conf_attr}" hidden>'
+            f'<td colspan="{n_cols}">'
+            f'<div class="case-detail-inner">'
+            f'{_per_test_detail_inner(r, routine_id, build_id, compare_meta, compare_label)}'
+            f'</div>'
+            f'</td></tr>'
         )
     out.append('</tbody></table>')
     return "\n".join(out)
@@ -909,9 +1146,8 @@ def _render_per_test_details(rows: list[dict],
             ("Status",          _status_pair(r["status_a"], r["status_b"])),
             ("Subtask",         f'<code>{r["subtask_id"]}</code>' if r["subtask_id"] else ""),
             ("Error",           _err_html(r["error_message"])),
-            ("Root cause",      _esc(r["root_cause"])),
-            ("Root cause from diff", _esc(r["root_cause_from_diff"])),
-            ("Reasoning",       _esc(r["reason"])),
+            ("Suspicious commits", _esc(r["suspicious_commits"])),
+            ("Reasoning",          _esc(r["reasoning"])),
         ]
         team_attr = _esc(r["team_name"]) if r["team_name"] else ""
         out.append(
@@ -929,15 +1165,43 @@ _FILTER_JS = """
 (function () {
   var teamSel = document.getElementById('team-filter');
   var verdictSel = document.getElementById('verdict-filter');
+  var confSel = document.getElementById('confidence-filter');
+  var cmpSel = document.getElementById('compare-filter');
+  var searchInput = document.getElementById('search-filter');
   if (!teamSel || !verdictSel) return;
-  var rows = document.querySelectorAll('table.per-test-table tbody tr[data-team]');
-  var details = document.querySelectorAll('section.detail[data-team]');
+  var rows = document.querySelectorAll('table.per-test-table tbody tr.case-row');
   var counter = document.getElementById('filter-count');
 
-  function populate(sel, attr, emptyLabel) {
+  // Cache lowercased text per row INCLUDING its (collapsed) detail row, so
+  // search hits content even when the detail panel isn't expanded.
+  rows.forEach(function (r) {
+    var text = (r.textContent || '');
+    var d = r.nextElementSibling;
+    if (d && d.classList.contains('case-detail')) {
+      text += ' ' + (d.textContent || '');
+    }
+    r.dataset.searchText = text.toLowerCase();
+  });
+
+  // Each facet dropdown declares which row attribute it filters on, plus
+  // an optional label-map for friendlier option labels. The 'self' key tells
+  // recountFacets which dropdown to skip when computing that facet's
+  // available counts (so picking team=Commerce doesn't zero out the team
+  // dropdown's own options — the user has to be able to switch back).
+  var facets = [
+    { sel: teamSel,    attr: 'data-team',       empty: '(no team)' },
+    { sel: verdictSel, attr: 'data-verdict',    empty: '(none)' },
+    { sel: confSel,    attr: 'data-confidence', empty: '(none)' },
+    { sel: cmpSel,     attr: 'data-compare',    empty: '(none)',
+      labelMap: { yes: 'Yes', no: 'No', missing: 'Missing' } },
+  ].filter(function (f) { return !!f.sel; });
+
+  // Initial population — full row set, every option visible. apply() will
+  // immediately rewrite these counts on first call.
+  facets.forEach(function (f) {
     var counts = {};
     rows.forEach(function (r) {
-      var v = r.getAttribute(attr) || '';
+      var v = r.getAttribute(f.attr) || '';
       counts[v] = (counts[v] || 0) + 1;
     });
     Object.keys(counts).sort(function (a, b) {
@@ -945,36 +1209,127 @@ _FILTER_JS = """
       if (b === '') return -1;
       return a.localeCompare(b);
     }).forEach(function (v) {
-      var label = (v === '' ? emptyLabel : v) + ' (' + counts[v] + ')';
+      var displayValue = v === ''
+        ? f.empty
+        : (f.labelMap && f.labelMap[v]) || v;
       var opt = document.createElement('option');
-      opt.value = v; opt.textContent = label;
-      sel.appendChild(opt);
+      opt.value = v;
+      opt.textContent = displayValue + ' (' + counts[v] + ')';
+      f.sel.appendChild(opt);
+    });
+  });
+
+  function searchMatch(el) {
+    var q = searchInput ? searchInput.value.trim().toLowerCase() : '';
+    if (!q) return true;
+    return (el.dataset.searchText || '').indexOf(q) !== -1;
+  }
+  function facetActive(f) { return f.sel.selectedIndex > 0; }
+  function facetMatch(f, el) {
+    return f.sel.selectedIndex === 0
+      || el.getAttribute(f.attr) === f.sel.value;
+  }
+  function matches(el) {
+    if (!searchMatch(el)) return false;
+    for (var i = 0; i < facets.length; i++) {
+      if (!facetMatch(facets[i], el)) return false;
+    }
+    return true;
+  }
+  // For each facet's options, count rows that match every OTHER active
+  // filter (search + every facet besides this one). This way a dropdown's
+  // own selection doesn't zero out its sibling options, but selecting
+  // anywhere else updates the counts shown on the remaining facets.
+  function recountFacets() {
+    facets.forEach(function (target) {
+      var subset = [];
+      for (var i = 0; i < rows.length; i++) {
+        var el = rows[i];
+        if (!searchMatch(el)) continue;
+        var ok = true;
+        for (var j = 0; j < facets.length; j++) {
+          if (facets[j] === target) continue;
+          if (!facetMatch(facets[j], el)) { ok = false; break; }
+        }
+        if (ok) subset.push(el);
+      }
+      var counts = {};
+      subset.forEach(function (el) {
+        var v = el.getAttribute(target.attr) || '';
+        counts[v] = (counts[v] || 0) + 1;
+      });
+      // Walk existing <option>s and rewrite their count suffix; skip the
+      // first option (the placeholder "All …" entry).
+      for (var k = 1; k < target.sel.options.length; k++) {
+        var opt = target.sel.options[k];
+        var v = opt.value;
+        var n = counts[v] || 0;
+        var displayValue = v === ''
+          ? target.empty
+          : (target.labelMap && target.labelMap[v]) || v;
+        opt.textContent = displayValue + ' (' + n + ')';
+      }
     });
   }
-  populate(teamSel,    'data-team',    '(no team)');
-  populate(verdictSel, 'data-verdict', '(none)');
-
-  function matches(el) {
-    var teamAll = teamSel.selectedIndex === 0;
-    var verdictAll = verdictSel.selectedIndex === 0;
-    return (teamAll    || el.getAttribute('data-team')    === teamSel.value)
-        && (verdictAll || el.getAttribute('data-verdict') === verdictSel.value);
-  }
+  var pillVerdictEls = document.querySelectorAll('[data-pill-verdict]');
+  var pillTotalEl    = document.querySelector('[data-pill-total]');
   function apply() {
     var shown = 0;
+    var verdictCounts = {};
     rows.forEach(function (r) {
       var m = matches(r);
       r.style.display = m ? '' : 'none';
-      if (m) shown += 1;
-    });
-    details.forEach(function (d) {
-      d.style.display = matches(d) ? '' : 'none';
+      // The inline detail row pairs with its parent — hide together when the
+      // filter rejects the parent. When the parent matches, leave the detail
+      // row alone so its `hidden` attribute (collapsed/expanded state)
+      // controls visibility.
+      var d = r.nextElementSibling;
+      if (d && d.classList.contains('case-detail')) {
+        d.style.display = m ? '' : 'none';
+      }
+      if (m) {
+        shown += 1;
+        var v = r.getAttribute('data-verdict') || '';
+        verdictCounts[v] = (verdictCounts[v] || 0) + 1;
+      }
     });
     if (counter) counter.textContent = shown + ' of ' + rows.length + ' tests';
+    pillVerdictEls.forEach(function (el) {
+      var v = el.getAttribute('data-pill-verdict');
+      el.textContent = verdictCounts[v] || 0;
+    });
+    if (pillTotalEl) pillTotalEl.textContent = shown;
+    recountFacets();
   }
   teamSel.addEventListener('change', apply);
   verdictSel.addEventListener('change', apply);
+  if (confSel) confSel.addEventListener('change', apply);
+  if (cmpSel) cmpSel.addEventListener('change', apply);
+  if (searchInput) {
+    searchInput.addEventListener('input', apply);
+    // Esc clears the search
+    searchInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { searchInput.value = ''; apply(); }
+    });
+  }
   apply();
+})();
+"""
+
+
+_TOGGLE_JS = """
+(function () {
+  var rows = document.querySelectorAll('table.per-test-table tbody tr.case-row');
+  rows.forEach(function (row) {
+    row.addEventListener('click', function (e) {
+      // Don't fire when the user clicks an actual link (Testray case-result).
+      if (e.target.closest('a')) return;
+      var detail = row.nextElementSibling;
+      if (!detail || !detail.classList.contains('case-detail')) return;
+      detail.hidden = !detail.hidden;
+      row.classList.toggle('expanded', !detail.hidden);
+    });
+  });
 })();
 """
 
@@ -988,15 +1343,42 @@ _PER_TEST_NOTE_HTML = """
 """
 
 
-def _render_per_test(meta: dict, payload: dict, rows: list[dict]) -> str:
+def _render_per_test(meta: dict, payload: dict, rows: list[dict],
+                     compare_meta: dict[str, dict] | None = None,
+                     compare_build_id: str | int | None = None,
+                     compare_label: str = "master",
+                     build_a_name: str | None = None,
+                     build_b_name: str | None = None) -> str:
     counts: dict[str, int] = defaultdict(int)
     for r in rows:
         counts[r["verdict"]] += 1
 
-    title = (
-        f"Triage report (per test) — Build A {meta.get('build_id_a', '?')} → "
-        f"Build B {meta.get('build_id_b', '?')}"
+    build_a_id = meta.get("build_id_a")
+    build_b_id = meta.get("build_id_b")
+    a_label = build_a_name or f"Build {build_a_id or '?'}"
+    b_label = build_b_name or f"Build {build_b_id or '?'}"
+    a_url = _TESTRAY_BUILD_URL.format(build=build_a_id) if build_a_id else None
+    b_url = _TESTRAY_BUILD_URL.format(build=build_b_id) if build_b_id else None
+    a_html = (
+        f'<a class="build-link" href="{a_url}" target="_blank" rel="noopener">'
+        f'{_esc(a_label)}</a>' if a_url else _esc(a_label)
     )
+    b_html = (
+        f'<a class="build-link" href="{b_url}" target="_blank" rel="noopener">'
+        f'{_esc(b_label)}</a>' if b_url else _esc(b_label)
+    )
+    title_html = f"Triage report (per test) — {a_html} → {b_html}"
+    title_text = f"Triage report (per test) — {a_label} → {b_label}"
+
+    compare_filter_html = ""
+    if compare_meta is not None:
+        compare_filter_html = (
+            f'<label for="compare-filter">Also failing in '
+            f'{_esc(compare_label)}:</label>'
+            f'<select id="compare-filter">'
+            f'<option value="">All</option>'
+            f'</select>'
+        )
     summary_bits = [
         f"Run: <code>{_esc(meta.get('run_id'))}</code>",
         f"Classifier: <code>{_esc(payload.get('classifier'))}</code>",
@@ -1013,42 +1395,103 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict]) -> str:
         cls = _VERDICT_CLASS[v]
         pills.append(
             f'<span class="pill"><span class="verdict {cls}">{v}</span>'
-            f'<span class="n">{n}</span></span>'
+            f'<span class="n" data-pill-verdict="{v}">{n}</span></span>'
         )
     pills.append(
         f'<span class="pill"><strong>Total tests:</strong> '
-        f'<span class="n">{len(rows)}</span></span>'
+        f'<span class="n" data-pill-total="1">{len(rows)}</span></span>'
     )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>{_esc(title)}</title>
+<title>{_esc(title_text)}</title>
 <style>{_CSS}
   /* Per-test report has 10 columns and the two root-cause cells need
      room — widen the page beyond the default 1180px. */
   main {{ max-width: 1640px; }}
+  h1 a.build-link {{ color: #0747a6; text-decoration: none; }}
+  h1 a.build-link:hover {{ text-decoration: underline; }}
   table.per-test-table {{ table-layout: auto; font-size: 12.5px; }}
   table.per-test-table th, table.per-test-table td {{ padding: 8px; }}
   table.per-test-table th.col-idx {{ width: 40px; }}
-  table.per-test-table th.col-link {{ width: 60px; }}
   table.per-test-table th.col-comp {{ width: 130px; }}
   table.per-test-table th.col-team {{ width: 110px; }}
-  table.per-test-table th.col-ticket {{ width: 110px; }}
   table.per-test-table th.col-status {{ width: 130px; }}
+  table.per-test-table th.col-confidence,
+  table.per-test-table td.col-confidence {{ width: 90px; text-align: center; }}
+  table.per-test-table th.col-test,
+  table.per-test-table td.col-test {{ min-width: 220px; max-width: 320px; }}
+  table.per-test-table td.col-test a.test-link {{
+    color: #0747a6;
+    text-decoration: none;
+  }}
+  table.per-test-table td.col-test a.test-link:hover {{
+    text-decoration: underline;
+  }}
+  table.per-test-table th.col-compare .cmp-header-label,
+  table.per-test-table th.col-compare .cmp-header-link {{
+    display: block;
+  }}
+  table.per-test-table th.col-compare .cmp-header-link {{
+    font-weight: 400;
+    font-size: 11px;
+    color: #0747a6;
+    text-decoration: none;
+    margin-top: 2px;
+  }}
+  table.per-test-table th.col-compare .cmp-header-link:hover {{
+    text-decoration: underline;
+  }}
+  /* Status cell wraps at whitespace only (between the two state spans),
+     never mid-word. Overrides the global tbody td overflow-wrap:anywhere. */
+  table.per-test-table td.col-status {{
+    word-break: normal;
+    overflow-wrap: normal;
+  }}
+  table.per-test-table td.col-status .status > span {{ white-space: nowrap; }}
   table.per-test-table th.col-verdict {{ width: 130px; }}
-  table.per-test-table th.col-rc, table.per-test-table td.col-rc {{ min-width: 200px; }}
-  table.per-test-table th.col-rcd, table.per-test-table td.col-rcd {{ min-width: 320px; }}
-  table.per-test-table td.col-rc, table.per-test-table td.col-rcd {{
+  table.per-test-table th.col-suspicious, table.per-test-table td.col-suspicious {{ min-width: 240px; }}
+  table.per-test-table th.col-reasoning, table.per-test-table td.col-reasoning {{ min-width: 320px; }}
+  table.per-test-table td.col-suspicious, table.per-test-table td.col-reasoning {{
     white-space: normal; line-height: 1.45;
   }}
+  table.per-test-table th.col-jira, table.per-test-table td.col-jira {{
+    width: 110px; text-align: center;
+  }}
+  table.per-test-table th.col-jira {{ cursor: help; }}
+  table.per-test-table th.col-compare,
+  table.per-test-table td.col-compare {{ width: 150px; text-align: center; }}
+  table.per-test-table th.col-compare {{ cursor: help; }}
+  .cmp {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }}
+  .cmp-yes     {{ background: #ffebe6; color: #ae2a19; border: 1px solid #ffbdad; }}
+  .cmp-no      {{ background: #e3fcef; color: #006644; border: 1px solid #abf5d1; }}
+  .cmp-missing {{ background: var(--c-row); color: var(--c-muted); border: 1px solid var(--c-border); }}
+  a.jira-create {{
+    display: inline-block;
+    padding: 4px 10px;
+    background: #0052cc;
+    color: #fff;
+    border-radius: 3px;
+    font-size: 12px;
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  a.jira-create:hover {{ background: #0747a6; }}
   table.per-test-table td.col-test {{
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12px;
   }}
   .filters {{
-    display: flex; align-items: center; gap: 10px;
+    display: flex; flex-direction: column; gap: 8px;
     margin: 18px 0 14px;
     padding: 10px 14px;
     background: var(--c-row);
@@ -1056,39 +1499,96 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict]) -> str:
     border-radius: 4px;
     font-size: 13px;
   }}
-  .filters select {{
+  .filters-row {{
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }}
+  .filters label {{ font-weight: 600; }}
+  .filters select, .filters input[type="search"] {{
     font: inherit; padding: 4px 6px;
     border: 1px solid var(--c-border);
     border-radius: 3px; background: white;
     min-width: 240px;
   }}
+  .filters input[type="search"] {{ min-width: 360px; flex: 1 1 auto; }}
   .filters .visible-count {{ color: var(--c-muted); margin-left: auto; }}
+  p.hint {{ color: var(--c-muted); font-size: 12.5px; margin: 4px 0 8px; }}
+  p.hint kbd {{
+    background: #fff; border: 1px solid var(--c-border); border-bottom-width: 2px;
+    border-radius: 3px; padding: 0 5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }}
+  /* Click-to-expand row affordance. Caret in the # column flips on expand. */
+  table.per-test-table tr.case-row {{ cursor: pointer; }}
+  table.per-test-table tr.case-row:hover td {{ background: #eef1f4; }}
+  table.per-test-table tr.case-row td.col-idx::before {{
+    content: "▸ "; color: var(--c-muted); font-size: 11px;
+  }}
+  table.per-test-table tr.case-row.expanded td.col-idx::before {{
+    content: "▾ "; color: var(--c-fg);
+  }}
+  table.per-test-table tr.case-row.expanded td {{
+    background: #f0f3f6; border-bottom-color: transparent;
+  }}
+  /* Inline detail row — sits directly under its parent. */
+  table.per-test-table tr.case-detail > td {{
+    padding: 0 0 0 0;
+    background: #fafbfc;
+    border-bottom: 2px solid var(--c-border);
+  }}
+  table.per-test-table tr.case-detail .case-detail-inner {{
+    padding: 14px 18px 16px;
+    border-left: 3px solid var(--c-border);
+    margin-left: 40px;  /* align under the col-idx caret */
+  }}
+  table.per-test-table tr.case-detail.bug   .case-detail-inner {{ border-left-color: var(--c-bug); }}
+  table.per-test-table tr.case-detail.needs .case-detail-inner {{ border-left-color: var(--c-needs); }}
+  table.per-test-table tr.case-detail.fp    .case-detail-inner {{ border-left-color: var(--c-fp); }}
+  table.per-test-table tr.case-detail.auto  .case-detail-inner {{ border-left-color: var(--c-auto); }}
+  table.per-test-table tr.case-detail dl {{
+    margin: 0;
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr);
+    gap: 6px 14px;
+  }}
+  table.per-test-table tr.case-detail dt {{ font-weight: 600; color: var(--c-muted); font-size: 13px; }}
+  table.per-test-table tr.case-detail dd {{
+    margin: 0; font-size: 13px; min-width: 0;
+    overflow-wrap: anywhere; word-break: break-word;
+  }}
 </style>
 </head>
 <body>
 <main>
-  <h1>{_esc(title)}</h1>
+  <h1>{title_html}</h1>
   <p class="summary">{' · '.join(summary_bits)}</p>
   <div class="totals">{''.join(pills)}</div>
   {_RATIONALE_HTML if counts.get("BUG", 0) == 0 else ""}
   {_PER_TEST_NOTE_HTML}
 
   <div class="filters">
-    <label for="team-filter">Team:</label>
-    <select id="team-filter"><option value="">All teams</option></select>
-    <label for="verdict-filter">Verdict:</label>
-    <select id="verdict-filter"><option value="">All verdicts</option></select>
-    <span class="visible-count" id="filter-count"></span>
+    <div class="filters-row">
+      <label for="team-filter">Team:</label>
+      <select id="team-filter"><option value="">All teams</option></select>
+      <label for="verdict-filter">Verdict:</label>
+      <select id="verdict-filter"><option value="">All verdicts</option></select>
+      <label for="confidence-filter">Confidence:</label>
+      <select id="confidence-filter"><option value="">All confidence</option></select>
+      {compare_filter_html}
+    </div>
+    <div class="filters-row">
+      <label for="search-filter">Search:</label>
+      <input id="search-filter" type="search" placeholder="filter by test, component, ticket, root cause… (Esc to clear)" autocomplete="off">
+      <span class="visible-count" id="filter-count"></span>
+    </div>
   </div>
 
   <h2>All tests</h2>
-  {_render_per_test_table(rows, meta.get('routine_id'), meta.get('build_id_b'))}
-
-  <h2>Details</h2>
-  {_render_per_test_details(rows, meta.get('routine_id'), meta.get('build_id_b'))}
+  <p class="hint">Click a row to expand its details inline. Press <kbd>Esc</kbd> in the search box to clear.</p>
+  {_render_per_test_table(rows, meta.get('routine_id'), meta.get('build_id_b'), compare_meta, compare_build_id, compare_label)}
 </main>
 <script>{_SORT_JS}</script>
 <script>{_FILTER_JS}</script>
+<script>{_TOGGLE_JS}</script>
 </body>
 </html>
 """
@@ -1265,7 +1765,9 @@ def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
 
 def render_run(run_dir: Path,
                testflow_id: str | int | None = None,
-               per_test: bool = False) -> Path:
+               per_test: bool = False,
+               compare_build_id: int | None = None,
+               compare_label: str = "master") -> Path:
     meta = yaml.safe_load((run_dir / "run.yml").read_text())
     if testflow_id is not None:
         meta["testflow_id"] = testflow_id
@@ -1273,14 +1775,33 @@ def render_run(run_dir: Path,
     diff_list = pd.read_csv(run_dir / "diff_list.csv")
     out = run_dir / "report.html"
 
-    if per_test:
+    if per_test or meta.get("mode") == "per-test":
         cfg = load_config()
         api_meta = _fetch_caseresult_meta(int(meta["build_id_b"]), cfg["testray"])
         cluster_map = _load_cluster_per_test(run_dir)
-        rows = _build_per_test_rows(
-            diff_list, payload["results"], api_meta, cluster_map,
+        ticket_map = _build_ticket_commit_map(
+            cfg.get("git", {}).get("repo_path"),
+            meta.get("git_hash_a"),
+            meta.get("git_hash_b"),
         )
-        out.write_text(_render_per_test(meta, payload, rows))
+        rows = _build_per_test_rows(
+            diff_list, payload["results"], api_meta, cluster_map, ticket_map,
+        )
+        compare_meta = None
+        if compare_build_id is not None:
+            compare_meta = _fetch_caseresult_meta(int(compare_build_id), cfg["testray"])
+        # Build names for the title — prefer fresh API lookup over the
+        # potentially-stale `api:<id>` placeholder stored in run.yml.
+        build_a_name = _fetch_build_name(int(meta["build_id_a"]), cfg["testray"])
+        build_b_name = _fetch_build_name(int(meta["build_id_b"]), cfg["testray"])
+        out.write_text(_render_per_test(
+            meta, payload, rows,
+            compare_meta=compare_meta,
+            compare_build_id=compare_build_id,
+            compare_label=compare_label,
+            build_a_name=build_a_name,
+            build_b_name=build_b_name,
+        ))
     elif meta.get("mode") == "by-subtask":
         diff_subtasks = pd.read_csv(run_dir / "diff_list_subtasks.csv")
         cluster_ann = _load_cluster_annotations(run_dir)
@@ -1304,11 +1825,23 @@ def main() -> None:
                          "when run.yml::mode is by-subtask. Fans subtask verdicts out "
                          "to member tests and enriches each row with component, team, "
                          "ticket id, and a Testray case-result deep-link via the "
-                         "Testray REST API.")
+                         "Testray REST API. Runs whose run.yml::mode is already "
+                         "per-test render this way automatically.")
+    ap.add_argument("--compare-build", type=int, default=None,
+                    help="Cross-reference each failing test against a second "
+                         "Testray build (typically the latest master / release "
+                         "build). Adds an 'Also failing in <label>' column per "
+                         "row showing whether the same test case is also in a "
+                         "non-passing state in that build.")
+    ap.add_argument("--compare-label", default="master",
+                    help="Display label for the --compare-build column "
+                         "(default: 'master').")
     args = ap.parse_args()
     out = render_run(args.run_dir.resolve(),
                      testflow_id=args.testflow_id,
-                     per_test=args.per_test)
+                     per_test=args.per_test,
+                     compare_build_id=args.compare_build,
+                     compare_label=args.compare_label)
     print(f"Wrote {out}")
 
 
