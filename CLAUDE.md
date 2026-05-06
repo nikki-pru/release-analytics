@@ -37,6 +37,7 @@ When in doubt about where new work belongs:
 apps/
   appscripts/     Google Apps Script tools against Testray/Sheets API
   dashboard/      Future: Liferay DXP portlet deployment of dashboards
+  pr-triage/      PR-triage — uniqueness check (vs project history) + PR diff match → Claude Code bundle
   scoring/        Standalone PR branch risk scoring engine (evaluate_pr.sh)
   triage/         Testray regression triage — batch pipeline + Claude Code workflow
 config/           DB connection, credentials template, environment setup
@@ -259,6 +260,9 @@ and run by humans, not the scheduled pipeline. When editing:
   analysis, LPD co-occurrence, TF-IDF, LDA
 - `.claude/skills/triage.skill` — triage workflow, classification rubric,
   `fact_triage_results` schema, tool contracts
+- `.claude/skills/pr-triage.skill` — PR-triage workflow (uniqueness check
+  against project history + PR diff match), `PR_CAUSED / NEEDS_REVIEW /
+  FALSE_POSITIVE` rubric, `runs/r_<id>/` bundle contract
 - `.claude/skills/ops.skill` — Release Team operational scripts under
   `ops/`: bundle validation, Jira parent-task automation, upgrade harness,
   ticket-range extraction, shared `liferay_utils` package

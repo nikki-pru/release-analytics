@@ -1,0 +1,205 @@
+---
+name: pr-triage
+description: >
+  Reference for the Liferay PR-triage workflow. Use this skill when
+  working on PR-attribution classification, interpreting uniqueness
+  signals against project history, or running the
+  uniqueness-check → diff-match → bundle flow against a Testray build
+  and a liferay-portal PR branch. Trigger when the user mentions
+  pr-triage, uniqueness detection, "is this build's failure caused by
+  this PR", error signature normalization, fact_pr_triage_results,
+  or runs/r_<id>/ bundles under apps/pr-triage/.
+---
+
+# PR-Triage Skill
+
+## Purpose
+
+Classify a Testray build's failing tests as caused / not-caused by a
+specific PR's changes in liferay-portal.
+
+Sister to `apps/triage` (build-triage). Where build-triage compares
+two builds and surfaces PASSED→FAILED transitions, PR-triage compares
+*one* build against the project's full failure history. There is no
+clean baseline build — the project's history *is* the baseline.
+
+A failure is **unique** if no prior build in the project has produced
+the same `(case_id, normalized_error)` signature. Only unique failures
+go to classification — recurring/upstream failures are filtered in
+code, not by the classifier.
+
+## Workflow shape
+
+Single mode in v0.3: bundle → Claude Code session classifies → write
+`results.json`. API mode (planned v0.4) consumes the same bundle.
+DB write to `fact_pr_triage_results` (planned v0.5) is staging-grade
+— eventual destination is the Testray platform itself, so don't
+over-invest in that schema.
+
+```
+run.sh
+  ├── Testray API: /o/c/builds/{id}, /o/testray-rest/v1.0/...
+  ├── working_db:  resolve case_ids, fetch FAILED history per case
+  ├── normalize.py: regex chain + md5 → error signature hashes
+  ├── classify:    UNIQUE_NEW_TEST / UNIQUE_NEW_ERROR / NOT_UNIQUE
+  ├── pr_diff.py:  git diff merge-base(base,target)..target
+  ├── hunk_match:  per unique row, token-substring match against diff paths
+  └── bundle.py:   write runs/r_<id>/
+                     ↓
+            Claude Code session classifies
+                     ↓
+                results.json
+                     ↓
+       v0.4 API mode (planned) / v0.5 submit (planned)
+```
+
+## CLI contract
+
+```bash
+bash apps/pr-triage/run.sh \
+  --target-branch  PR-38301 \
+  --target-source  api \
+  --target-build-id 471865557 \
+  --base-branch    release-2026.q1
+```
+
+All four args are required. `--target-source api` is the only mode
+in v0.3; `tar` and `db` are planned. `--base-branch` is required
+specifically because a wrong base silently produces a garbage diff;
+the script verifies merge-base resolves before doing any work.
+
+## Bundle file contracts
+
+`apps/pr-triage/runs/r_<ts>_<branch>_<build>/`:
+
+| File | Shape / purpose |
+|---|---|
+| `run.yml`             | YAML metadata: `run_id`, `target_branch`, `base_branch`, `target_build_id`, `build.{project_id, routine_id, duedate, name}`, `diff.{merge_base, files_changed, lines_changed}`, `unique_counts.{unique_new_test, unique_new_error, not_unique}`, `prepared_at`, `classifier: agent:claude-opus-4-7`. |
+| `unique_rows.csv`      | Columns: `case_id, verdict, case_name, component, team, flaky, error_hash, prior_failure_count, prior_distinct_hashes, matched_files_count, error`. One row per unique failure. |
+| `hunks.txt`           | Per-unique-row matched diff hunks, separated by row markers. Empty hunk block means tokens didn't match anything in the diff — fall back to `diff_full.diff`. |
+| `diff_full.diff`      | Unfiltered output of `git diff $(merge-base BASE TARGET) TARGET`. The source of truth — `hunks.txt` is a derived view. |
+| `prompt.md`           | Inline per-row data + rubric. Generated from the same data as `unique_rows.csv` for in-session reading. |
+| `results.schema.json` | JSON Schema. Validates `results.json`. |
+| `results.json`        | **Written by the classifier.** One object per unique row. |
+
+## Verdicts (results.json)
+
+`PR_CAUSED` / `NEEDS_REVIEW` / `FALSE_POSITIVE`. Different from
+build-triage's `BUG / NEEDS_REVIEW / FALSE_POSITIVE` — PR-triage's
+question is PR-attribution specifically, so `PR_CAUSED` replaces
+`BUG`. `FALSE_POSITIVE` keeps the same meaning (failure unrelated
+to the PR).
+
+`culprit_file` and `specific_change` are **required** for
+`PR_CAUSED`. The schema rejects rows that omit them.
+
+## Uniqueness model — why it works without a baseline build
+
+| Uniqueness verdict | Meaning | Action |
+|---|---|---|
+| `UNIQUE_NEW_TEST`  | `case_id` has zero prior occurrences in this project's history. | Classify (likely PR added a new test). |
+| `UNIQUE_NEW_ERROR` | `case_id` has prior failures, but this exact normalized-error hash is new. | Classify (signature suggests unique cause). |
+| `NOT_UNIQUE`       | This `(case_id, normalized_error)` has been seen before in the project. | Not classified — filtered in code. |
+
+Filter scope: same project (auto-resolved from build metadata), any
+routine, status = FAILED only, builds with `duedate < target.duedate`.
+
+Normalization rules in `normalize.py`: strip ISO timestamps, hex
+addresses (`0x…`, `@…`), `Thread-N`, `pid=N`, stack-frame line
+numbers (`:N)` → `:)`), collapse whitespace. Then md5. Hash collision
+risk is negligible at the scale of one project's failure history.
+
+## Differences vs build-triage
+
+| Concern | build-triage | PR-triage |
+|---|---|---|
+| Comparison axis | Two builds (PASSED→FAILED transitions) | One build vs project history (unique failure signatures) |
+| Baseline requirement | A clean passing baseline build | None — history is the baseline |
+| Diff source | `dim_build.git_hash_a` → `_b` | `git diff merge-base(base, target)..target` |
+| Module → component lookup | `dim_module_component_map` (RAP DB) | None — substring tokens only |
+| Verdicts | BUG / NEEDS_REVIEW / FALSE_POSITIVE | PR_CAUSED / NEEDS_REVIEW / FALSE_POSITIVE |
+| Output table | `fact_triage_results` | `fact_pr_triage_results` (planned v0.5, staging-grade) |
+
+## Data dependencies
+
+- **Testray API** (`config.yml: testray.{base_url, client_id, client_secret}`) — OAuth2 client_credentials.
+- **`testray_working_db`** (`config.yml: databases.testray_working_db`) — raw Testray backup. Per `db/testray_analytical_README.md`, this DB is intended-droppable after the analytical bootstrap; PR-triage requires it restored.
+- **liferay-portal checkout** (`config.yml: git.repo_path`) — both `--target-branch` and `--base-branch` must exist as local refs.
+
+## Schema details — testray_working_db
+
+Tables used:
+
+- `o_22235989312226_caseresult`
+  - `c_caseresultid_` (PK)
+  - `r_buildtocaseresult_c_buildid` → build FK
+  - `r_casetocaseresult_c_caseid` → case FK
+  - `duestatus_` — status enum, `'FAILED'` for failed
+  - `errors_` — full error text (TEXT, no truncation)
+- `o_22235989312226_build`
+  - `c_buildid_` (PK)
+  - `r_projecttobuilds_c_projectid` — project filter
+  - `duedate_` — chronological cut
+
+Indexes that make the per-case history query fast:
+`ix_a8d74b8d (caseresult.r_buildtocaseresult_c_buildid)`,
+`ix_951b8237 (caseresult.r_casetocaseresult_c_caseid)`,
+`ix_bcb6a688 (build.r_projecttobuilds_c_projectid)`.
+
+## When to stop and ask the user
+
+- The build's `duedate` predates the PR's earliest commit — no failure
+  can be PR-caused; surface and confirm before classifying everything
+  as FALSE_POSITIVE.
+- `unique_new_test + unique_new_error == 0` — nothing to classify, surface
+  the verdict and stop.
+- `diff_full.diff` is empty or trivial (< 5 changed lines) but unique
+  failures exist — likely wrong base branch.
+- Many unique rows have `matched_files_count = 0` and the test names
+  don't thematically connect to the diff — likely token matching is
+  too narrow; flag rather than classify all as FALSE_POSITIVE.
+- Two pieces of evidence contradict (matched hunks point to PR_CAUSED
+  but the error is a known flake pattern with `flaky=True`).
+
+## Backlog and known caveats
+
+- **v0.4 API mode** — bundle shape stays the same; only the consumer
+  changes. Build it on top of `apps/triage/classify_api.py` with
+  prompt caching against the rubric header. Will reuse OAuth2,
+  pagination, and Anthropic SDK patterns.
+- **v0.5 submit** — `fact_pr_triage_results` columns deferred until
+  we see real classification volume. Staging-grade table; eventual
+  destination is the Testray platform itself.
+- **Hunk match heuristic** — token substring matching on test name
+  + component / team. Misses transitive deps; bundle includes
+  `diff_full.diff` for the classifier to fall back on. Same gap as
+  build-triage; same mitigation.
+- **Empty errors** — caseresults with empty `errors_` hash to the
+  same empty signature and may cluster as NOT_UNIQUE with each other.
+  Surface only if it skews counts in practice.
+- **Stale working_db snapshot** — caseresult_ids on the target build
+  newer than the snapshot fall back to UNIQUE_NEW_TEST with a `note`
+  in evidence. Surface; don't pretend it's verified uniqueness.
+- **Shared utils to apps/_common/** — once both triage apps stabilize,
+  extract: Testray OAuth2 + paginated fetch, `/o/c/builds/{id}` and
+  `/o/c/cases/{id}` lookups, psycopg2 helpers, portal-repo diff
+  helpers, prompt.md / results.schema.json conventions. Tracked in
+  the project backlog.
+
+## What NOT to do
+
+- Don't reuse build-triage's `BUG` label here. The verdict set is
+  intentionally different.
+- Don't reach into RAP fact tables (`dim_module_component_map`,
+  `dim_component`) for module/component resolution — PR-triage is
+  conceptually a Testray-domain tool and shouldn't couple to the
+  RAP pipeline DB.
+- Don't classify rows with `verdict = NOT_UNIQUE` — they're not in
+  the bundle; if you see one, the bundle is malformed.
+- Don't bypass the merge-base check — `git diff base..target` (two
+  dots) gives a different (often wrong) diff than
+  `git diff $(merge-base base target)..target` (the symmetric-ish
+  PR-style diff).
+- Don't recalibrate the normalization rules silently. Add to the
+  list in `normalize.py` and document the trigger case in the next
+  session.

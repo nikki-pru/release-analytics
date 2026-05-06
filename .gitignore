@@ -63,6 +63,7 @@ __pycache__/
 apps/triage/traces/
 apps/triage/output/
 apps/triage/runs/
+apps/pr-triage/runs/
 
 # -----------------------------------------------------------------------------
 # Database dumps — produced by db/testray_analytical_dump.sh, 2-5GB each

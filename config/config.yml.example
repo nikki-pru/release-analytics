@@ -21,6 +21,21 @@ databases:
   #   user:
   #   password:
 
+  # testray_working_db — REQUIRED for apps/pr-triage. The raw Testray
+  # backup with the o_22235989312226_* object schema. PR-triage queries
+  # full errors_ text from this DB for novelty detection — the
+  # truncated `errors` column on testray_analytical isn't sufficient.
+  #
+  # Per db/testray_analytical_README.md, this DB is dropped after
+  # bootstrapping testray_analytical. Restore the raw backup when
+  # running PR-triage.
+  testray_working_db:
+    host: localhost
+    port: 5432
+    dbname: testray_working_db
+    user: release
+    password: triage_local
+
 git:
   # Absolute path to your local liferay-portal checkout. prepare.py reads
   # diffs from this working tree.
