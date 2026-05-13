@@ -271,18 +271,27 @@ def fetch_case_metadata(case_ids: list[int], cfg: dict) -> dict[int, dict]:
     out: dict[int, dict] = {}
     for i, cid in enumerate(case_ids, start=1):
         url = f"{base}/o/c/cases/{cid}"
-        req = urllib.request.Request(
-            url, headers={"Authorization": f"Bearer {token}"},
-        )
-        try:
+        def _do_request(tok):
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {tok}"},
+            )
             with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read())
+                return json.loads(resp.read())
+        try:
+            body = _do_request(token)
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                raise SystemExit("Testray API 401 — token expired. Re-run.")
-            if e.code == 404:
+                token = _testray_oauth_token(cfg)
+                try:
+                    body = _do_request(token)
+                except urllib.error.HTTPError as e2:
+                    if e2.code == 404:
+                        continue
+                    raise
+            elif e.code == 404:
                 continue
-            raise
+            else:
+                raise
         comp_id = body.get("r_componentToCases_c_componentId")
         out[int(cid)] = {
             "name":         body.get("name") or "",
@@ -311,18 +320,27 @@ def fetch_component_metadata(component_ids: list[int], cfg: dict) -> dict[int, s
     out: dict[int, str] = {}
     for i, cid in enumerate(component_ids, start=1):
         url = f"{base}/o/c/components/{cid}"
-        req = urllib.request.Request(
-            url, headers={"Authorization": f"Bearer {token}"},
-        )
-        try:
+        def _do_request(tok):
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {tok}"},
+            )
             with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read())
+                return json.loads(resp.read())
+        try:
+            body = _do_request(token)
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                raise SystemExit("Testray API 401 — token expired. Re-run.")
-            if e.code == 404:
+                token = _testray_oauth_token(cfg)
+                try:
+                    body = _do_request(token)
+                except urllib.error.HTTPError as e2:
+                    if e2.code == 404:
+                        continue
+                    raise
+            elif e.code == 404:
                 continue
-            raise
+            else:
+                raise
         name = body.get("name")
         if name:
             out[int(cid)] = name
@@ -634,8 +652,10 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
     if baseline.empty or target.empty:
         return pd.DataFrame()
 
-    target_has_ids = target["case_id"].notna().any()
-    key_cols = ["case_id"] if target_has_ids else ["case_name", "component_name"]
+    target_has_ids   = target["case_id"].notna().any()
+    baseline_has_ids = baseline["case_id"].notna().any()
+    both_have_ids    = target_has_ids and baseline_has_ids
+    key_cols = ["case_id"] if both_have_ids else ["case_name", "component_name"]
 
     b = _aggregate_baseline(baseline, key_cols=key_cols)
     t = _aggregate_target(target,     key_cols=key_cols)
@@ -646,10 +666,25 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
         & merged["status_b"].isin(["FAILED", "BLOCKED", "UNTESTED"])
     ].copy()
 
-    case_id_col = "case_id"          if target_has_ids     else "case_id_a"
-    name_col    = "case_name_a"      if target_has_ids     else "case_name"
-    comp_col    = "component_name_a" if target_has_ids     else "component_name"
-    flaky_col   = "case_flaky_a"
+    if both_have_ids:
+        case_id_col = "case_id"
+        name_col    = "case_name_a"
+        comp_col    = "component_name_a"
+    else:
+        name_col = "case_name"
+        comp_col = "component_name"
+        # Prefer target-side case_id (api targets carry real ids; csv baselines don't).
+        case_id_col = "case_id_b" if target_has_ids else "case_id_a"
+    # case_flaky may live on baseline (db) or target (api after enrichment).
+    if "case_flaky_a" in diff.columns and "case_flaky_b" in diff.columns:
+        diff["_flaky_combined"] = diff["case_flaky_a"].where(
+            diff["case_flaky_a"].notna(), diff["case_flaky_b"]
+        )
+        flaky_col = "_flaky_combined"
+    elif "case_flaky_a" in diff.columns:
+        flaky_col = "case_flaky_a"
+    else:
+        flaky_col = "case_flaky_b"
 
     out = pd.DataFrame({
         "testray_case_id":        diff[case_id_col],
