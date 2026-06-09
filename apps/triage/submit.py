@@ -32,8 +32,8 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from apps.triage.render_html import render_run
-from apps.triage.store import (
+from .render_html import render_run
+from .store import (
     ensure_schema, ensure_run_log, upsert_triage_results, log_run,
 )
 

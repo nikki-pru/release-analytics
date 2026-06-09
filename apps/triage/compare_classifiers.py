@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from apps.triage.db import get_rap_conn, query_df
+from .db import get_rap_conn, query_df
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,8 @@
+# Build context is apps/triage/ — keep the image lean and reproducible.
+runs/
+dist/
+__pycache__/
+*.pyc
+.venv/
+*.dump
+TR3-triage/

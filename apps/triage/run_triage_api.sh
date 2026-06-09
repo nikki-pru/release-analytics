@@ -53,9 +53,11 @@
 
 set -eo pipefail
 
+# Layout-agnostic: run the package by its directory name from its parent,
+# so this works both in-repo (apps/triage) and standalone (triage/).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_ROOT"
+PKG="$(basename "$SCRIPT_DIR")"
+cd "$SCRIPT_DIR/.."
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -150,7 +152,7 @@ echo "=========================================================="
 
 # `tee /dev/stderr` shows prepare's progress live; command substitution
 # captures stdout so we can grep for the run_dir line.
-PREPARE_OUT=$(python3 -m apps.triage.prepare "${PREPARE_EXTRA[@]}" | tee /dev/stderr)
+PREPARE_OUT=$(python3 -m "$PKG.prepare" "${PREPARE_EXTRA[@]}" | tee /dev/stderr)
 
 RUN_DIR=$(printf '%s\n' "$PREPARE_OUT" | sed -n 's|^Run bundle ready: ||p' | tail -1)
 if [[ -z "$RUN_DIR" ]]; then
@@ -177,7 +179,7 @@ CLASSIFY_ARGS=("$RUN_DIR")
 [[ -n "$CLASSIFIER" ]] && CLASSIFY_ARGS+=(--classifier "$CLASSIFIER")
 [[ "$DRY_RUN" == true ]] && CLASSIFY_ARGS+=(--dry-run)
 
-python3 -m apps.triage.classify_api "${CLASSIFY_ARGS[@]}"
+python3 -m "$PKG.classify_api" "${CLASSIFY_ARGS[@]}"
 
 if [[ "$DRY_RUN" == true ]]; then
     echo ""
@@ -198,7 +200,7 @@ echo "=========================================================="
 SUBMIT_ARGS=("$RUN_DIR")
 [[ "$NO_UPSERT" == true ]] && SUBMIT_ARGS+=(--no-upsert)
 
-python3 -m apps.triage.submit "${SUBMIT_ARGS[@]}"
+python3 -m "$PKG.submit" "${SUBMIT_ARGS[@]}"
 
 echo ""
 echo "Done. Bundle: $RUN_DIR"

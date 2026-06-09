@@ -10,7 +10,7 @@ Table: fact_triage_results
   - Token usage tracked for cost monitoring
 
 Usage:
-    from apps.triage.store import ensure_schema, upsert_triage_results
+    from .store import ensure_schema, upsert_triage_results
 
     ensure_schema()
     upsert_triage_results(df, build_id_a=410851196, build_id_b=451312408,
@@ -19,7 +19,7 @@ Usage:
 
 import pandas as pd
 from datetime import datetime
-from apps.triage.db import get_rap_conn
+from .db import get_rap_conn
 
 
 # ---------------------------------------------------------------------------

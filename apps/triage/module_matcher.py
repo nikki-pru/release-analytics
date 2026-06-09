@@ -25,7 +25,7 @@ The first match wins. Strategy is logged so you can see what fired.
 import re
 import pandas as pd
 from functools import lru_cache
-from apps.triage.db import get_rap_conn, query_df
+from .db import get_rap_conn, query_df
 
 
 # ---------------------------------------------------------------------------

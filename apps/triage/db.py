@@ -10,7 +10,7 @@ Credentials are never hardcoded — always read from config.yml.
 Mirrors the config/release_analytics_db.R pattern used in the R pipeline.
 
 Usage:
-    from apps.triage.db import get_rap_conn, get_testray_conn
+    from .db import get_rap_conn, get_testray_conn
 
     with get_rap_conn() as conn:
         df = pd.read_sql("SELECT * FROM dim_component", conn)
@@ -26,25 +26,17 @@ import psycopg2.extras
 from pathlib import Path
 from contextlib import contextmanager
 
+from ._config import find_config_file
+
 
 # ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """
-    Load config.yml from the project root.
-    Walks up from this file's location to find it.
-    """
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "config" / "config.yml"
-        if candidate.exists():
-            with open(candidate) as f:
-                return yaml.safe_load(f)
-    raise FileNotFoundError(
-        "config.yml not found. Expected at project root (liferay-release-analytics/config.yml)"
-    )
+    """Load config.yml via the shared layout-agnostic resolver."""
+    with open(find_config_file()) as f:
+        return yaml.safe_load(f)
 
 
 # ---------------------------------------------------------------------------

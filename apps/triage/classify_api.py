@@ -100,8 +100,10 @@ except ImportError:
     raise SystemExit(1)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH  = PROJECT_ROOT / "config" / "config.yml"
+from ._config import find_config_file
+
+TRIAGE_DIR  = Path(__file__).resolve().parent
+CONFIG_PATH = find_config_file()
 
 DEFAULT_CLASSIFIER = "api:claude-opus-4-7"
 
@@ -596,7 +598,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
             )
             (batches_dir / f"batch_{i:02d}.md").write_text(preview, encoding="utf-8")
         print(f"\n--dry-run: wrote {len(batches)} batch preview file(s) to "
-              f"{batches_dir.relative_to(PROJECT_ROOT)}/")
+              f"{batches_dir.relative_to(TRIAGE_DIR)}/")
         print("Inspect the batch_*.md files to see what would be sent. "
               "No API calls made.")
         return run_dir / "results.json"
@@ -727,7 +729,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
     out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     print("\n" + "=" * 60)
-    print(f"Wrote {out.relative_to(PROJECT_ROOT)}")
+    print(f"Wrote {out.relative_to(TRIAGE_DIR)}")
     print(f"Classified: {len(all_results)} / {len(sections)} failures")
     print(f"Tokens:     in={usage_totals['input_tokens']:,} "
           f"out={usage_totals['output_tokens']:,} "
@@ -737,7 +739,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
         print("NOTE: cache_read_input_tokens=0 across a multi-batch run — "
               "shared header is below Opus 4.7's 4096-token cacheable "
               "minimum, so caching did not activate.", file=sys.stderr)
-    print(f"Next:       python3 -m apps.triage.submit {out.parent.relative_to(PROJECT_ROOT)}")
+    print(f"Next:       python3 -m apps.triage.submit {out.parent.relative_to(TRIAGE_DIR)}")
     return out
 
 

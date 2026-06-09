@@ -284,6 +284,40 @@ dominated by input tokens, not call count.
 
 ---
 
+## Docker (GHCR)
+
+The same package ships as a standalone image, `ghcr.io/liferay-release/triage`,
+for headless / no-checkout-of-this-repo use. It is built straight from
+this directory — the code is layout-agnostic (relative imports +
+`$TRIAGE_CONFIG`), so there is no separate "standalone copy" to maintain;
+the image *is* the artifact.
+
+Default distribution mode is **api×api** (Testray REST on both sides), so
+no database is required. The one runtime dependency is a liferay-portal
+checkout for the git diff — mounted as a volume.
+
+```bash
+docker run --rm \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -v "$PWD/config.yml":/config/config.yml:ro \
+  -v /path/to/liferay-portal:/portal \
+  ghcr.io/liferay-release/triage run \
+    --baseline-source api --baseline-build-id <A> --baseline-hash <sha> \
+    --target-source   api --target-build-id   <B> --target-hash   <sha> \
+    --no-upsert
+```
+
+Commands: `prepare`, `classify`, `submit`, `run` (one-shot api pipeline),
+`help`. See `config.yml.example` for the mounted config shape; the image
+resolves it via `$TRIAGE_CONFIG` (default `/config/config.yml`).
+
+Published by `.github/workflows/triage-image.yml` — push a `triage-v*`
+tag for a versioned image + `:latest`, or run the workflow manually with
+a custom tag. Files: `Dockerfile`, `.dockerignore`, `entrypoint.sh`,
+`config.yml.example`.
+
+---
+
 ## Output
 
 In `apps/triage/runs/r_<id>/` (gitignored):

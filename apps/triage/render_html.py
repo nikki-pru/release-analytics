@@ -26,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from apps.triage.prepare import (
+from .prepare import (
     _testray_fetch_paginated,
     _testray_oauth_token,
     fetch_commits_in_range,

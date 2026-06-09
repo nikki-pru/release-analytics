@@ -1,0 +1,45 @@
+# Triage container config — mount at the path in $TRIAGE_CONFIG
+# (default /config/config.yml):
+#
+#   docker run -v "$PWD/config.yml":/config/config.yml:ro ...
+#
+# Distribution default is api×api (Testray REST on both sides) — no local
+# database required. ANTHROPIC_API_KEY is passed via env, never stored here.
+
+git:
+  # Mount your liferay-portal checkout into the container and point here.
+  #   docker run -v /path/to/liferay-portal:/portal ...
+  # The checkout must contain both build commits (prepare runs `git diff`
+  # between their hashes; it may `git fetch` if a hash is missing).
+  repo_path: /portal
+  base_branch: master
+
+testray:
+  # OAuth2 client_credentials for the Testray REST API (the `api` source).
+  client_id: ""
+  client_secret: ""
+
+triage:
+  classifier:
+    api:
+      model: claude-opus-4-7
+      effort: xhigh
+      max_chars_per_batch: 400000
+      max_output_tokens: 16000
+      delay_between_batches_seconds: 2
+
+# Optional — only if you persist results to a DB (drop `--no-upsert`).
+# Omit entirely for headless api×api runs.
+# databases:
+#   release_analytics:
+#     host: <host>
+#     port: 5432
+#     dbname: release_analytics
+#     user: <user>
+#     password: <password>
+#   testray:
+#     host: <host>
+#     port: 5432
+#     dbname: testray_analytical
+#     user: <user>
+#     password: <password>

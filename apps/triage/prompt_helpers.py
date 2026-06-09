@@ -21,6 +21,8 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from ._config import find_config_file, config_dir
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -28,38 +30,29 @@ import yaml
 
 @lru_cache(maxsize=1)
 def load_triage_config() -> dict:
-    """Load the `triage:` section of config/config.yml, walking up from here."""
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "config" / "config.yml"
-        if candidate.exists():
-            with open(candidate) as f:
-                return (yaml.safe_load(f) or {}).get("triage", {}) or {}
-    return {}
-
-
-@lru_cache(maxsize=1)
-def _find_project_root() -> Path:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "config" / "config.yml").exists() or \
-           (parent / "config" / "module_component_map.csv").exists():
-            return parent
-    return here.parents[2]
+    """Load the `triage:` section of config.yml via the shared resolver."""
+    try:
+        with open(find_config_file()) as f:
+            return (yaml.safe_load(f) or {}).get("triage", {}) or {}
+    except FileNotFoundError:
+        return {}
 
 
 @lru_cache(maxsize=1)
 def load_component_map() -> list[dict]:
     """
-    Load `config/module_component_map.csv` — authoritative module → testray
-    component + team mapping. Returns a list of dicts with keys:
+    Load `module_component_map.csv` (next to config.yml) — authoritative
+    module → testray component + team mapping. Returns a list of dicts:
       module_path (may be empty for component+team-only rows),
       testray_component, team_name.
 
     Triage reads this CSV directly (no DB dependency) so the tool works on a
     dev laptop without a local release_analytics database.
     """
-    path = _find_project_root() / "config" / "module_component_map.csv"
+    try:
+        path = config_dir() / "module_component_map.csv"
+    except FileNotFoundError:
+        return []
     if not path.exists():
         return []
     with open(path) as f:

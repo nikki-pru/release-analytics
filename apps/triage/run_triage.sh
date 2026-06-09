@@ -32,9 +32,12 @@
 
 set -eo pipefail
 
+# Layout-agnostic: run the package by its directory name from its parent,
+# so this works both in-repo (apps/triage -> `-m triage.…` from apps/) and
+# standalone (triage/ -> `-m triage.…` from its parent).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_ROOT"
+PKG="$(basename "$SCRIPT_DIR")"
+cd "$SCRIPT_DIR/.."
 
 BUILD_A=""
 BUILD_B=""
@@ -101,7 +104,7 @@ echo "=========================================================="
 echo "apps.triage.prepare"
 echo "=========================================================="
 
-PREPARE_OUT=$(python3 -m apps.triage.prepare "${PREPARE_EXTRA[@]}" | tee /dev/stderr)
+PREPARE_OUT=$(python3 -m "$PKG.prepare" "${PREPARE_EXTRA[@]}" | tee /dev/stderr)
 
 RUN_DIR=$(printf '%s\n' "$PREPARE_OUT" | sed -n 's|^Run bundle ready: ||p' | tail -1)
 if [[ -z "$RUN_DIR" ]]; then
@@ -123,7 +126,7 @@ Next steps:
      .claude/skills/triage.skill.
   2. Write $RUN_DIR/results.json matching results.schema.json.
   3. Submit:
-       python3 -m apps.triage.submit $RUN_DIR
+       python3 -m "$PKG.submit" $RUN_DIR
      Add --no-upsert to validate + print the summary without
      writing to fact_triage_results.
 
