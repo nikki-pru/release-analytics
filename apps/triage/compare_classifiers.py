@@ -8,7 +8,7 @@ mode (api:claude-opus-4-7) as a substitute for Claude Code mode
 
 The comparison joins rows on testray_case_id and reports:
     - overall agreement rate (same classification)
-    - confusion matrix (BUG / NEEDS_REVIEW / FALSE_POSITIVE / AUTO_CLASSIFIED)
+    - confusion matrix (BUG / NEEDS_REVIEW / TEST_FIX / FALSE_POSITIVE / AUTO_CLASSIFIED)
     - culprit_file agreement on shared BUG rows
     - rows present in one classifier but missing from the other
     - subtask-level rollup: when either classifier ran in --by-subtask mode

@@ -89,6 +89,7 @@ def _commits_for_text(text: str,
 _VERDICT_CLASS = {
     "BUG":             "bug",
     "NEEDS_REVIEW":    "needs",
+    "TEST_FIX":        "testfix",
     "FALSE_POSITIVE":  "fp",
     "AUTO_CLASSIFIED": "auto",
 }
@@ -97,6 +98,7 @@ _CSS = """
   :root {
     --c-bug: #c0392b;
     --c-needs: #d68910;
+    --c-testfix: #2471a3;
     --c-fp: #5d6d7e;
     --c-auto: #7f8c8d;
     --c-bg: #fdfdfd;
@@ -175,6 +177,7 @@ _CSS = """
   }
   .verdict.bug { background: var(--c-bug); }
   .verdict.needs { background: var(--c-needs); }
+  .verdict.testfix { background: var(--c-testfix); }
   .verdict.fp { background: var(--c-fp); }
   .verdict.auto { background: var(--c-auto); }
   .conf {
@@ -213,6 +216,7 @@ _CSS = """
   }
   section.detail.bug { border-left-color: var(--c-bug); }
   section.detail.needs { border-left-color: var(--c-needs); }
+  section.detail.testfix { border-left-color: var(--c-testfix); }
   section.detail.fp { border-left-color: var(--c-fp); }
   section.detail.auto { border-left-color: var(--c-auto); }
   section.detail h3 {
@@ -553,7 +557,7 @@ def _fingerprint(r: dict) -> str:
     return f"{r['verdict']}|{culprit}|{err}|{reason}"
 
 
-_VERDICT_ORDER = {"BUG": 0, "NEEDS_REVIEW": 1, "FALSE_POSITIVE": 2, "AUTO_CLASSIFIED": 3}
+_VERDICT_ORDER = {"BUG": 0, "NEEDS_REVIEW": 1, "TEST_FIX": 2, "FALSE_POSITIVE": 3, "AUTO_CLASSIFIED": 4}
 
 
 def _render_details(rows: list[dict]) -> str:
@@ -614,7 +618,7 @@ def _render(meta: dict, payload: dict, rows: list[dict]) -> str:
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(
@@ -1334,15 +1338,6 @@ _TOGGLE_JS = """
 """
 
 
-_PER_TEST_NOTE_HTML = """
-<section class="rationale">
-  <strong>Note:</strong> Test fixes may show up as
-  <span class="verdict fp">FALSE_POSITIVE</span> for now. This will be
-  improved in a future iteration.
-</section>
-"""
-
-
 def _render_per_test(meta: dict, payload: dict, rows: list[dict],
                      compare_meta: dict[str, dict] | None = None,
                      compare_build_id: str | int | None = None,
@@ -1390,7 +1385,7 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict],
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(
@@ -1563,7 +1558,6 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict],
   <p class="summary">{' · '.join(summary_bits)}</p>
   <div class="totals">{''.join(pills)}</div>
   {_RATIONALE_HTML if counts.get("BUG", 0) == 0 else ""}
-  {_PER_TEST_NOTE_HTML}
 
   <div class="filters">
     <div class="filters-row">
@@ -1698,7 +1692,7 @@ def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(

@@ -134,6 +134,27 @@ coverage across BUG rows (a deliberate softening of the rule's "always"
 wording — tracked so we can tighten back to 100% once the workflow is
 stable).
 
+BUG also requires the production change to be a **genuine defect** — if
+the change was intentional and the test merely lagged, that is TEST_FIX.
+
+### TEST_FIX
+The failure **is** caused by the diff, but the production change was
+**intentional and correct** and only a stale test lags behind it. Tells:
+- the test asserts on a UI label / selector / element / API shape the
+  diff deliberately changed (e.g. a control changed from a button to a
+  combobox, a label was renamed, an endpoint signature changed);
+- the diff migrated one test layer to the new behavior but left another
+  stale (classic: Playwright updated, legacy Poshi/Selenium selector not);
+- the fix is to update the test, not to revert or repair production code.
+
+**Do not name the production file as `culprit_file`** — that would
+mislabel a correct change as a defect, and BUG `culprit_file`s feed the
+defect training data. Leave `culprit_file` null (or name the stale
+**test** file) and describe the required test change in `specific_change`.
+Use `high` confidence when the intentional-change evidence is in the diff.
+When you can see the diff caused the failure but can't tell whether
+production or the test is wrong, prefer **NEEDS_REVIEW**.
+
 ### NEEDS_REVIEW
 The safe default for any of:
 - Confidence is `medium` or `low` and the candidate theory cannot be
@@ -214,7 +235,7 @@ Extend via `triage.auto_classify_patterns` in `config/config.yml`.
 | error_message      | TEXT          |                                                        |
 | match_strategy     | VARCHAR(64)   | `confidence=<h\|m\|l>` for agent rows, `auto` / `missing` otherwise |
 | pre_classification | VARCHAR(64)   | BUILD_FAILURE \| ENV_* \| NO_ERROR \| null             |
-| classification     | VARCHAR(32)   | BUG \| NEEDS_REVIEW \| FALSE_POSITIVE \| AUTO_CLASSIFIED |
+| classification     | VARCHAR(32)   | BUG \| NEEDS_REVIEW \| TEST_FIX \| FALSE_POSITIVE \| AUTO_CLASSIFIED |
 | **classifier**     | VARCHAR(64)   | `batch:v1` (legacy API, retired), `agent:claude-opus-4-7` (Claude Code mode), `api:claude-opus-4-7` (API mode), `human`, … |
 | specific_change    | TEXT          |                                                        |
 | reason             | TEXT          |                                                        |
@@ -368,7 +389,7 @@ After `submit.py` completes, output a session summary using the
 template in `apps/triage/CLAUDE.md` (section "End of session summary").
 Key requirements:
 
-- Headline table with BUG / NEEDS_REVIEW / FALSE_POSITIVE / AUTO_CLASSIFIED counts.
+- Headline table with BUG / NEEDS_REVIEW / TEST_FIX / FALSE_POSITIVE / AUTO_CLASSIFIED counts.
 - **Direct verdict line** answering "Are the failures caused by the
   diff?" — the table alone forces the reader to do the math.
 - **BUG cluster grouping** — 2–5 shared-root-cause groups naming culprit

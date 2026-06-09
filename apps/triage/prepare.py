@@ -52,12 +52,12 @@ import psycopg2
 import psycopg2.extras
 import yaml
 
-from apps.triage import prompt_helpers
+from . import prompt_helpers
+from ._config import find_config_file
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TRIAGE_DIR   = Path(__file__).resolve().parent
 RUNS_DIR     = TRIAGE_DIR / "runs"
-CONFIG_PATH  = PROJECT_ROOT / "config" / "config.yml"
+CONFIG_PATH  = find_config_file()
 
 DEFAULT_CLASSIFIER = "agent:claude-opus-4-7"
 
@@ -898,7 +898,7 @@ RESULTS_SCHEMA = {
                 "additionalProperties": False,
                 "properties": {
                     "testray_case_id": {"type": "integer"},
-                    "classification":  {"enum": ["BUG", "NEEDS_REVIEW", "FALSE_POSITIVE"]},
+                    "classification":  {"enum": ["BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"]},
                     "confidence":      {"enum": ["high", "medium", "low"]},
                     "culprit_file":    {"type": ["string", "null"]},
                     "specific_change": {"type": ["string", "null"]},
@@ -945,7 +945,7 @@ RESULTS_SCHEMA_SUBTASK = {
                                           "items": {"type": "integer"},
                                           "minItems": 1},
                     "classification":  {"enum": ["BUG", "NEEDS_REVIEW",
-                                                  "FALSE_POSITIVE"]},
+                                                  "FALSE_POSITIVE", "TEST_FIX"]},
                     "confidence":      {"enum": ["high", "medium", "low"]},
                     "culprit_file":    {"type": ["string", "null"]},
                     "specific_change": {"type": ["string", "null"]},
@@ -1026,12 +1026,18 @@ judge whether each failure is caused by a hunk in the diff.
 
 **Confidence is structural, not metadata.** Your `confidence` field gates which classification you may use:
 
-- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the failure. **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW. A linked Jira ticket confirming the regression also qualifies.
+- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the failure, **and the production change is a genuine defect** (not an intentional change the test merely failed to keep up with — that is TEST_FIX). **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW. A linked Jira ticket confirming the regression also qualifies.
+- **TEST_FIX** — the failure **is** caused by the diff, but the production change was **intentional and correct** and only a stale test lags behind it. Tells:
+  - the test asserts on a UI label / selector / element / API shape that the diff deliberately changed (e.g. a control changed from a button to a combobox, a label was renamed, an endpoint signature changed),
+  - the diff migrated one test layer to the new behavior but left another stale (classic: Playwright updated, legacy Poshi/Selenium selector not), or
+  - the fix is to update the test, not to revert or repair production code.
+  Do **NOT** name the production file as `culprit_file` — that would mislabel a correct change as a defect (BUG culprit_files feed defect training data). Leave `culprit_file` null (or name the stale **test** file) and describe the required test change in `specific_change`. Use `high` confidence when the intentional-change evidence is in the diff.
 - **NEEDS_REVIEW** — the safe default for any of:
   - Confidence is `medium` or `low` and you have a candidate theory you cannot fully verify from this prompt
   - The failing test plausibly imports, extends, or depends on code in another changed module that has no hunk matching the test's name
   - **Two or more ticket clusters (LPD/LPP/LPS-XXXXX) in this diff plausibly affect the failing test's space** — list all candidates separated by `; ` in `specific_change`. Do not pick the most plausible one; the human reviewer disambiguates.
   - The error message is generic enough (e.g. "compileTestIntegrationJava failed", "BUILD FAILED", aggregate batch status) that multiple changes in this range could explain it
+  - You can see the diff caused it but cannot tell whether the production change or the test is wrong — prefer NEEDS_REVIEW over guessing BUG vs TEST_FIX
   - You'd want a human to confirm before calling it
 - **FALSE_POSITIVE** — clearly environmental or genuinely unrelated. May be `high` confidence (timeouts, gradle build infrastructure, chrome version, TEST_SETUP_ERROR are confidently environmental). Common patterns:
   - Environmental (DB, chrome version, CI infra, TEST_SETUP_ERROR, gradle build infrastructure)
@@ -1059,11 +1065,12 @@ Rows in `diff_list.csv` with `pre_classification` already set (BUILD_FAILURE, EN
 
 1. Read `error_message` in `diff_list.csv`.
 2. Scan `hunks.txt` for files whose path contains tokens from `component_name` or `test_case`.
-3. If a hunk plausibly causes the error → **BUG**, name `culprit_file` = the specific file path from the diff.
-4. If a hunk is thematically related but not clearly the cause → **NEEDS_REVIEW**.
-5. If no per-failure hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (test class name → likely importee in a changed module). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
-6. If the error is a classic flake pattern (timeout, element-not-present, concurrent-thread assertion, setup error) AND no hunk touches the relevant module AND no transitive candidate exists → **FALSE_POSITIVE**.
-7. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
+3. If a hunk plausibly causes the error AND it looks like a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff.
+4. If a hunk shows the production change was **intentional** and the test simply asserts on the old behavior (renamed label, changed selector/element/API the diff deliberately changed) → **TEST_FIX**. Leave `culprit_file` null (or name the stale test file); describe the test change in `specific_change`.
+5. If a hunk is thematically related but not clearly the cause → **NEEDS_REVIEW**.
+6. If no per-failure hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (test class name → likely importee in a changed module). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
+7. If the error is a classic flake pattern (timeout, element-not-present, concurrent-thread assertion, setup error) AND no hunk touches the relevant module AND no transitive candidate exists → **FALSE_POSITIVE**.
+8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
 
 ## Output
 
@@ -1129,7 +1136,8 @@ every member case-row in `fact_triage_results`.
 
 Same rubric as per-test mode, applied at the subtask level — write one verdict per group:
 
-- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members. **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW.
+- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members **and the production change is a genuine defect** (not an intentional change the tests merely lag behind — that is TEST_FIX). **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW.
+- **TEST_FIX** — the shared failure **is** diff-caused, but the production change was **intentional and correct** and the member tests simply assert on the old behavior (renamed label, changed selector/element/API the diff deliberately changed; or one test layer was migrated and a legacy one left stale). The fix is to update the tests, not production. Do **NOT** name the production file as `culprit_file` (that mislabels a correct change as a defect); leave it null or name the stale test, and describe the test change in `specific_change`.
 - **NEEDS_REVIEW** — the safe default for any of:
   - Confidence is `medium` or `low` and you have a candidate theory you cannot fully verify from this prompt
   - Members of the group plausibly import, extend, or depend on code in another changed module that has no hunk matching their names
@@ -1152,11 +1160,12 @@ Subtasks where every member already has `pre_classification` set are auto-classi
 
 1. Read the **shared error** at the top of the subtask block — it's the same error string Testray clustered all member case-results under.
 2. Scan `hunks.txt` for files whose path contains tokens from any member's `test_case` or `component_name`. The matched hunks for representative members are embedded inline.
-3. Hunk plausibly causes the *shared* error → **BUG**, name `culprit_file` = the specific file path from the diff.
-4. Hunk thematically related but not the clear cause → **NEEDS_REVIEW**.
-5. No per-member hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (member class names → likely importees in changed modules). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
-6. Classic flake pattern (timeout, element-not-present, concurrent-thread assertion, TEST_SETUP_ERROR) AND no hunk touches a relevant module AND no transitive candidate → **FALSE_POSITIVE**.
-7. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
+3. Hunk plausibly causes the *shared* error as a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff.
+4. Hunk shows the production change was **intentional** and the tests assert on old behavior → **TEST_FIX** (culprit_file null or the stale test; describe the test change in `specific_change`).
+5. Hunk thematically related but not the clear cause → **NEEDS_REVIEW**.
+6. No per-member hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (member class names → likely importees in changed modules). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
+7. Classic flake pattern (timeout, element-not-present, concurrent-thread assertion, TEST_SETUP_ERROR) AND no hunk touches a relevant module AND no transitive candidate → **FALSE_POSITIVE**.
+8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
 
 ## Output
 
@@ -1824,7 +1833,7 @@ def _finalize_bundle(
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
     diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path)
-    print(f"   {diff_lines} lines → {diff_path.relative_to(PROJECT_ROOT)}")
+    print(f"   {diff_lines} lines → {diff_path.relative_to(TRIAGE_DIR)}")
 
     print(f"→ Step 4/6 fragments + filtered hunks …")
     fragments = derive_test_fragments(df)
@@ -1833,7 +1842,7 @@ def _finalize_bundle(
     hunks_path = run_dir / "hunks.txt"
     if fragments:
         run_extract_hunks(diff_path, fragments_path, hunks_path)
-        print(f"   {len(fragments)} fragments → {hunks_path.relative_to(PROJECT_ROOT)}")
+        print(f"   {len(fragments)} fragments → {hunks_path.relative_to(TRIAGE_DIR)}")
     else:
         # Happens when neither side carries case_name (e.g. api × api): no
         # tokens to narrow the diff. Fall back to the full diff; classify
@@ -1943,7 +1952,7 @@ def _finalize_bundle(
         mode=mode,
     )
 
-    rel = run_dir.relative_to(PROJECT_ROOT)
+    rel = run_dir.relative_to(TRIAGE_DIR)
     print(f"\nRun bundle ready: {rel}")
     print(f"Next: open {rel}/prompt.md in your Claude Code session and classify.")
     print(f"Then: python3 apps/triage/submit.py {rel}")

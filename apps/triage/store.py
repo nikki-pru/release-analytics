@@ -62,7 +62,10 @@ CREATE TABLE IF NOT EXISTS fact_triage_results (
     -- pre_classification: auto-classified env/infra before reasoning
     --   BUILD_FAILURE, ENV_CHROME, ENV_DEPENDENCY, ENV_DATE, ENV_SETUP, NO_ERROR
     -- classification: reasoning output or AUTO_CLASSIFIED
-    --   BUG, NEEDS_REVIEW, FALSE_POSITIVE, AUTO_CLASSIFIED
+    --   BUG, NEEDS_REVIEW, FALSE_POSITIVE, TEST_FIX, AUTO_CLASSIFIED
+    --   TEST_FIX = diff-caused but the production change was intentional;
+    --     a stale test lags. culprit_file is null (or the stale test), never
+    --     the production file — keeps BUG-culprit defect training data clean.
     -- classifier: who produced this row — batch:v1 (legacy Anthropic API),
     --   agent:claude-opus-4-7 (in-session Claude Code), human, etc.
     pre_classification   VARCHAR(64),
@@ -224,6 +227,7 @@ CREATE TABLE IF NOT EXISTS triage_run_log (
     bug_count    INTEGER,
     needs_review INTEGER,
     false_pos    INTEGER,
+    test_fix     INTEGER,
     auto_class   INTEGER,
     flaky_excl   INTEGER,
     total_tokens_in  INTEGER,
@@ -238,6 +242,11 @@ def ensure_run_log():
     with get_rap_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_RUN_LOG_SQL)
+            # Retrofit test_fix onto pre-existing tables (CREATE TABLE IF NOT
+            # EXISTS won't add new columns to an already-created table).
+            cur.execute(
+                "ALTER TABLE triage_run_log ADD COLUMN IF NOT EXISTS test_fix INTEGER;"
+            )
         conn.commit()
 
 
@@ -262,13 +271,13 @@ def log_run(
             cur.execute("""
                 INSERT INTO triage_run_log (
                     build_id_a, build_id_b, git_hash_a, git_hash_b, classifier,
-                    total_cases, bug_count, needs_review, false_pos, auto_class,
-                    flaky_excl, total_tokens_in, total_tokens_out,
+                    total_cases, bug_count, needs_review, false_pos, test_fix,
+                    auto_class, flaky_excl, total_tokens_in, total_tokens_out,
                     duration_seconds, notes
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s,
+                    %s, %s, %s, %s,
                     %s, %s
                 )
             """, (
@@ -277,6 +286,7 @@ def log_run(
                 counts.get("BUG", 0),
                 counts.get("NEEDS_REVIEW", 0),
                 counts.get("FALSE_POSITIVE", 0),
+                counts.get("TEST_FIX", 0),
                 counts.get("AUTO_CLASSIFIED", 0),
                 flaky_excluded,
                 tokens_in,

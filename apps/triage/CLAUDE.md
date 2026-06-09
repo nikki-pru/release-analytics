@@ -1,8 +1,16 @@
 # Triage — Claude Code Workflow
 
 Classifies Testray PASSED→FAILED/BLOCKED/UNTESTED regressions as
-BUG / NEEDS_REVIEW / FALSE_POSITIVE and writes results to
+BUG / TEST_FIX / NEEDS_REVIEW / FALSE_POSITIVE and writes results to
 `fact_triage_results`.
+
+**TEST_FIX** is for failures the diff *caused* where the production
+change was intentional and correct — only a stale test lags (e.g. a
+renamed label or a selector the diff changed; a Playwright migration
+that left a legacy Poshi test behind). Do **not** put the production
+file in `culprit_file` (that mislabels a correct change as a defect and
+poisons BUG-culprit training data) — leave it null or name the stale
+test, and describe the test change in `specific_change`.
 
 **Two modes, one bundle.** `prepare.py` produces a classifier-agnostic
 run bundle. From there:
@@ -116,8 +124,11 @@ For each **non-flaky, non-pre-classified** row in `diff_list.csv`:
    `component_name` or `test_case`. The prompt.md already embeds the
    heuristically-matched hunks per failure — start there.
 3. Evidence evaluation:
-   - Hunk plausibly causes the error → **BUG**, name `culprit_file` =
-     the specific path from the diff.
+   - Hunk shows a genuine defect that caused the error → **BUG**, name
+     `culprit_file` = the specific path from the diff.
+   - Hunk shows the production change was **intentional** and the test
+     asserts on the old behavior → **TEST_FIX** (culprit_file null or
+     the stale test; describe the test change in `specific_change`).
    - Thematically related but indirect → **NEEDS_REVIEW**.
    - No relevant hunk + classic flake pattern → **FALSE_POSITIVE**.
 4. If a linked Jira ticket is present in `linked_issues`, read the
@@ -326,7 +337,8 @@ makes runs comparable over time.
 
 | Classification                | Count |
 |-------------------------------|------:|
-| BUG (caused by diff)          | <x>   |
+| BUG (defect caused by diff)   | <x>   |
+| TEST_FIX (stale test, intentional change) | <t> |
 | NEEDS_REVIEW                  | <y>   |
 | FALSE_POSITIVE                | <z>   |
 | AUTO_CLASSIFIED (breakdown)   | <w>   |

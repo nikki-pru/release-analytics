@@ -42,7 +42,7 @@ from .store import (
 # Validation
 # ---------------------------------------------------------------------------
 
-_CLASSIFICATIONS = {"BUG", "NEEDS_REVIEW", "FALSE_POSITIVE"}
+_CLASSIFICATIONS = {"BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"}
 _CONFIDENCES     = {"high", "medium", "low"}
 
 MODE_PER_TEST   = "per-test"
