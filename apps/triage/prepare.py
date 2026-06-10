@@ -898,7 +898,7 @@ RESULTS_SCHEMA = {
                 "additionalProperties": False,
                 "properties": {
                     "testray_case_id": {"type": "integer"},
-                    "classification":  {"enum": ["BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"]},
+                    "classification":  {"enum": ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"]},
                     "confidence":      {"enum": ["high", "medium", "low"]},
                     "culprit_file":    {"type": ["string", "null"]},
                     "specific_change": {"type": ["string", "null"]},
@@ -944,7 +944,7 @@ RESULTS_SCHEMA_SUBTASK = {
                     "case_ids":        {"type": "array",
                                           "items": {"type": "integer"},
                                           "minItems": 1},
-                    "classification":  {"enum": ["BUG", "NEEDS_REVIEW",
+                    "classification":  {"enum": ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW",
                                                   "FALSE_POSITIVE", "TEST_FIX"]},
                     "confidence":      {"enum": ["high", "medium", "low"]},
                     "culprit_file":    {"type": ["string", "null"]},
@@ -1026,18 +1026,18 @@ judge whether each failure is caused by a hunk in the diff.
 
 **Confidence is structural, not metadata.** Your `confidence` field gates which classification you may use:
 
-- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the failure, **and the production change is a genuine defect** (not an intentional change the test merely failed to keep up with — that is TEST_FIX). **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW. A linked Jira ticket confirming the regression also qualifies.
+- **BUG** (confirmed) — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the failure, **and the production change is a genuine defect** (not an intentional change the test merely failed to keep up with — that is TEST_FIX). **MUST name a `culprit_file`.** A linked Jira ticket confirming the regression also qualifies. BUG and POSSIBLE_BUG `culprit_file`s are the labeled defect-attribution training data — only use BUG when you have actually verified the culprit.
+- **POSSIBLE_BUG** — exactly **one** plausible diff-caused theory at **`medium`** confidence that you cannot verify to `high` from this prompt: a single changed file (or single ticket cluster) that most likely caused the failure, and it looks like a defect rather than an intentional change. **Name the single candidate in `culprit_file`** (this is what separates POSSIBLE_BUG from NEEDS_REVIEW — a concrete, single attribution). If you have **two or more** competing candidates, that is NEEDS_REVIEW (multi-cause), not POSSIBLE_BUG. If you cannot name any concrete file, that is NEEDS_REVIEW (transitive/low). POSSIBLE_BUG is the "likely a bug, needs a human to confirm the one culprit" tier.
 - **TEST_FIX** — the failure **is** caused by the diff, but the production change was **intentional and correct** and only a stale test lags behind it. Tells:
   - the test asserts on a UI label / selector / element / API shape that the diff deliberately changed (e.g. a control changed from a button to a combobox, a label was renamed, an endpoint signature changed),
   - the diff migrated one test layer to the new behavior but left another stale (classic: Playwright updated, legacy Poshi/Selenium selector not), or
   - the fix is to update the test, not to revert or repair production code.
   Do **NOT** name the production file as `culprit_file` — that would mislabel a correct change as a defect (BUG culprit_files feed defect training data). Leave `culprit_file` null (or name the stale **test** file) and describe the required test change in `specific_change`. Use `high` confidence when the intentional-change evidence is in the diff.
-- **NEEDS_REVIEW** — the safe default for any of:
-  - Confidence is `medium` or `low` and you have a candidate theory you cannot fully verify from this prompt
-  - The failing test plausibly imports, extends, or depends on code in another changed module that has no hunk matching the test's name
-  - **Two or more ticket clusters (LPD/LPP/LPS-XXXXX) in this diff plausibly affect the failing test's space** — list all candidates separated by `; ` in `specific_change`. Do not pick the most plausible one; the human reviewer disambiguates.
-  - The error message is generic enough (e.g. "compileTestIntegrationJava failed", "BUILD FAILED", aggregate batch status) that multiple changes in this range could explain it
-  - You can see the diff caused it but cannot tell whether the production change or the test is wrong — prefer NEEDS_REVIEW over guessing BUG vs TEST_FIX
+- **NEEDS_REVIEW** — the safe default when you can't narrow to a single culprit. Any of:
+  - **Two or more candidate causes** — multiple changed files or ticket clusters (LPD/LPP/LPS-XXXXX) in this diff plausibly affect the failing test's space. List ALL candidates separated by `; ` in `specific_change`. Do not pick the most plausible one; the human reviewer disambiguates. (A *single* candidate at medium confidence is POSSIBLE_BUG, not this.)
+  - **Transitive / unverifiable** — the failing test plausibly imports, extends, or depends on changed code but you cannot name a concrete single culprit file, or confidence is `low`.
+  - The error message is generic enough (e.g. "compileTestIntegrationJava failed", "BUILD FAILED", aggregate batch status, "Failed to run test on CI") that multiple changes in this range could explain it
+  - You can see the diff caused it but cannot tell whether the production change or the test is wrong — prefer NEEDS_REVIEW over guessing
   - You'd want a human to confirm before calling it
 - **FALSE_POSITIVE** — clearly environmental or genuinely unrelated. May be `high` confidence (timeouts, gradle build infrastructure, chrome version, TEST_SETUP_ERROR are confidently environmental). Common patterns:
   - Environmental (DB, chrome version, CI infra, TEST_SETUP_ERROR, gradle build infrastructure)
@@ -1136,12 +1136,12 @@ every member case-row in `fact_triage_results`.
 
 Same rubric as per-test mode, applied at the subtask level — write one verdict per group:
 
-- **BUG** — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members **and the production change is a genuine defect** (not an intentional change the tests merely lag behind — that is TEST_FIX). **MUST name a `culprit_file`.** A plausible-sounding theory at `medium` confidence is NOT a BUG — it is NEEDS_REVIEW.
+- **BUG** (confirmed) — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members **and the production change is a genuine defect** (not an intentional change the tests merely lag behind — that is TEST_FIX). **MUST name a `culprit_file`.** BUG and POSSIBLE_BUG culprit_files feed defect-attribution training data — only use BUG when the culprit is actually verified.
+- **POSSIBLE_BUG** — exactly **one** plausible diff-caused theory at **`medium`** confidence for the shared error that you cannot verify to `high`: a single changed file (or single ticket cluster) that most likely caused it, looking like a defect rather than an intentional change. **Name the single candidate in `culprit_file`.** Two or more competing candidates → NEEDS_REVIEW (multi-cause). No concrete file → NEEDS_REVIEW (transitive/low).
 - **TEST_FIX** — the shared failure **is** diff-caused, but the production change was **intentional and correct** and the member tests simply assert on the old behavior (renamed label, changed selector/element/API the diff deliberately changed; or one test layer was migrated and a legacy one left stale). The fix is to update the tests, not production. Do **NOT** name the production file as `culprit_file` (that mislabels a correct change as a defect); leave it null or name the stale test, and describe the test change in `specific_change`.
-- **NEEDS_REVIEW** — the safe default for any of:
-  - Confidence is `medium` or `low` and you have a candidate theory you cannot fully verify from this prompt
-  - Members of the group plausibly import, extend, or depend on code in another changed module that has no hunk matching their names
-  - **Two or more ticket clusters (LPD/LPP/LPS-XXXXX) in this diff plausibly affect this group's space** — list all candidates separated by `; ` in `specific_change`
+- **NEEDS_REVIEW** — the safe default when you can't narrow to a single culprit. Any of:
+  - **Two or more candidate causes** — multiple changed files / ticket clusters (LPD/LPP/LPS-XXXXX) plausibly affect this group's space — list ALL candidates separated by `; ` in `specific_change`. (A *single* candidate at medium confidence is POSSIBLE_BUG.)
+  - **Transitive / unverifiable** — members plausibly import/extend/depend on changed code but you cannot name a concrete single culprit file, or confidence is `low`
   - The error is generic enough (build failed, batch failed, "Failed prior to running test") that multiple changes could explain it
   - You'd want a human to confirm before calling it
 - **FALSE_POSITIVE** — clearly environmental or genuinely unrelated. May be `high` confidence (timeouts, gradle build infrastructure, TEST_SETUP_ERROR, Poshi `ElementNotFoundPoshiRunnerException`, Selenium `NoSuchElementException`). The fact that one verdict covers many tests makes the rubric *more* useful here, not less — a Poshi flake pattern is still a Poshi flake pattern when 30 tests share it.
@@ -1255,6 +1255,34 @@ def fetch_commits_in_range(git_repo: Path, hash_a: str, hash_b: str) -> list[tup
         out = subprocess.run(
             ["git", "-C", str(git_repo), "log",
              "--pretty=format:%h\t%s", f"{hash_a}..{hash_b}"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    commits = []
+    for line in out.splitlines():
+        if "\t" in line:
+            h, subj = line.split("\t", 1)
+            if _is_noise_commit_subject(subj):
+                continue
+            commits.append((h, subj))
+    return commits
+
+
+def fetch_commits_for_file(git_repo: Path, hash_a: str, hash_b: str,
+                           file_path: str) -> list[tuple[str, str]]:
+    """Commits in A..B that touched `file_path`, newest-first, noise-filtered.
+
+    Used as a fallback when ticket-based attribution finds nothing but a
+    verdict names a culprit_file. Returns [(short_hash, subject), ...];
+    empty list on any failure (attribution is purely additive)."""
+    if not (file_path and (git_repo / ".git").is_dir()):
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(git_repo), "log",
+             "--pretty=format:%h\t%s", f"{hash_a}..{hash_b}",
+             "--", file_path],
             capture_output=True, text=True, check=True, timeout=30,
         ).stdout
     except (subprocess.SubprocessError, FileNotFoundError):

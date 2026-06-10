@@ -19,9 +19,9 @@ builds of a routine. Output feeds two consumers:
 
 1. **Investigation** — BUG cases eventually generate LPD-Task tickets with
    culprit file and rationale (Jira auto-creation is backlog, not wired up).
-2. **Training data** — labeled BUG rows with `culprit_file` become supervised
-   signal for the NN-based PR risk prediction layer (backlog, pending
-   `pr_outcomes` population).
+2. **Training data** — labeled BUG and POSSIBLE_BUG rows with
+   `culprit_file` become supervised signal for the NN-based PR risk
+   prediction layer (backlog, pending `pr_outcomes` population).
 
 ## Workflow shape — prepare / classify / submit
 
@@ -123,9 +123,11 @@ every `prompt.md`. This section is the conceptual reference; treat
 (`high | medium | low`) is structural, not metadata.
 
 ### BUG
-Code change in the build pair clearly caused the failure. Requires:
-- **`high` confidence on a verifiable culprit** — a plausible theory at
-  `medium` confidence is **NEEDS_REVIEW**, not BUG.
+The **confirmed / high-confidence tier**. Code change in the build pair
+clearly caused the failure, on a culprit you can verify. Requires:
+- **`high` confidence on a *verified* culprit** — a single plausible
+  theory at `medium` confidence is **POSSIBLE_BUG**, not BUG; two or more
+  competing theories, or low confidence, is **NEEDS_REVIEW**.
 - A hunk in the diff (direct or via imports/lifecycle) explaining the
   failure, OR a linked Jira ticket confirming the regression.
 
@@ -136,6 +138,23 @@ stable).
 
 BUG also requires the production change to be a **genuine defect** — if
 the change was intentional and the test merely lagged, that is TEST_FIX.
+
+### POSSIBLE_BUG
+The **medium-confidence tier** for a single concrete attribution. Use when
+there is exactly **one** plausible diff-caused culprit — a single changed
+file or a single ticket cluster — that looks like a genuine defect but that
+you **cannot raise to `high` confidence** from the prompt alone. Requires:
+- **`medium` confidence on one candidate.** If you can verify it to `high`,
+  that is BUG; if you can't get to a concrete file at all, that is
+  NEEDS_REVIEW.
+- **Name the single candidate in `culprit_file`.** This one concrete
+  attribution is what separates POSSIBLE_BUG from NEEDS_REVIEW.
+
+**Two or more competing candidates → NEEDS_REVIEW** (multi-cause — the
+human disambiguates). **No concrete file, or low confidence →
+NEEDS_REVIEW.** Like BUG, POSSIBLE_BUG names a real production defect, so
+do not use it for an intentional change a stale test lags behind — that is
+still TEST_FIX.
 
 ### TEST_FIX
 The failure **is** caused by the diff, but the production change was
@@ -148,28 +167,31 @@ The failure **is** caused by the diff, but the production change was
 - the fix is to update the test, not to revert or repair production code.
 
 **Do not name the production file as `culprit_file`** — that would
-mislabel a correct change as a defect, and BUG `culprit_file`s feed the
-defect training data. Leave `culprit_file` null (or name the stale
+mislabel a correct change as a defect, and BUG / POSSIBLE_BUG
+`culprit_file`s feed the defect training data. Leave `culprit_file` null (or name the stale
 **test** file) and describe the required test change in `specific_change`.
 Use `high` confidence when the intentional-change evidence is in the diff.
 When you can see the diff caused the failure but can't tell whether
 production or the test is wrong, prefer **NEEDS_REVIEW**.
 
 ### NEEDS_REVIEW
-The safe default for any of:
-- Confidence is `medium` or `low` and the candidate theory cannot be
-  fully verified from the prompt.
+**Narrowed** now that a single medium-confidence candidate is
+**POSSIBLE_BUG**, not NEEDS_REVIEW. This tier is specifically the
+**multi-cause / unpinnable / low-confidence** bucket — any of:
+- **Two or more candidate causes or ticket clusters** (LPD/LPP/LPS-XXXXX)
+  in the diff plausibly affect the failing test's space (**multi-cause**).
+  List all candidates in `specific_change` separated by `; `. Do not pick
+  a single theory — the human reviewer disambiguates. (Exactly one
+  candidate at `medium` confidence is **POSSIBLE_BUG** instead.)
 - The failing test plausibly imports, extends, or depends on code in
-  another changed module that has no hunk matching the test's name —
-  the **transitive-dep** case. Note the suspected file in
-  `specific_change` so a human can verify.
-- **Multiple ticket clusters** (LPD/LPP/LPS-XXXXX) in the diff
-  plausibly affect the failing test's space. List all candidates in
-  `specific_change` separated by `; `. Do not pick a single theory —
-  the human reviewer disambiguates.
-- Generic error messages (e.g. `compileTestIntegrationJava failed`,
-  `BUILD FAILED`, aggregate batch status) where multiple changes could
-  explain the failure.
+  another changed module that has no hunk matching the test's name and
+  that you **cannot pin to a single file** — the **transitive-dep** case.
+  Note the suspected area in `specific_change` so a human can verify.
+- Confidence is `low`, or the candidate theory cannot be reduced to a
+  concrete file from the prompt.
+- Generic / aggregate error messages (e.g. `compileTestIntegrationJava
+  failed`, `BUILD FAILED`, aggregate batch status) where multiple changes
+  could explain the failure.
 
 ### FALSE_POSITIVE
 Clearly environmental or genuinely unrelated. May be `high` confidence
@@ -235,7 +257,7 @@ Extend via `triage.auto_classify_patterns` in `config/config.yml`.
 | error_message      | TEXT          |                                                        |
 | match_strategy     | VARCHAR(64)   | `confidence=<h\|m\|l>` for agent rows, `auto` / `missing` otherwise |
 | pre_classification | VARCHAR(64)   | BUILD_FAILURE \| ENV_* \| NO_ERROR \| null             |
-| classification     | VARCHAR(32)   | BUG \| NEEDS_REVIEW \| TEST_FIX \| FALSE_POSITIVE \| AUTO_CLASSIFIED |
+| classification     | VARCHAR(32)   | BUG \| POSSIBLE_BUG \| NEEDS_REVIEW \| TEST_FIX \| FALSE_POSITIVE \| AUTO_CLASSIFIED |
 | **classifier**     | VARCHAR(64)   | `batch:v1` (legacy API, retired), `agent:claude-opus-4-7` (Claude Code mode), `api:claude-opus-4-7` (API mode), `human`, … |
 | specific_change    | TEXT          |                                                        |
 | reason             | TEXT          |                                                        |
@@ -389,7 +411,7 @@ After `submit.py` completes, output a session summary using the
 template in `apps/triage/CLAUDE.md` (section "End of session summary").
 Key requirements:
 
-- Headline table with BUG / NEEDS_REVIEW / TEST_FIX / FALSE_POSITIVE / AUTO_CLASSIFIED counts.
+- Headline table with BUG / POSSIBLE_BUG / NEEDS_REVIEW / TEST_FIX / FALSE_POSITIVE / AUTO_CLASSIFIED counts.
 - **Direct verdict line** answering "Are the failures caused by the
   diff?" — the table alone forces the reader to do the math.
 - **BUG cluster grouping** — 2–5 shared-root-cause groups naming culprit
@@ -416,8 +438,10 @@ Mitigations:
 
 ## Relationship to pr_outcomes (backlog)
 
-`fact_triage_results` BUG rows with non-null `culprit_file` are the
-labeled training data for the future NN-based PR risk prediction layer.
+`fact_triage_results` BUG and POSSIBLE_BUG rows with non-null
+`culprit_file` are the labeled training data for the future NN-based PR
+risk prediction layer (the attribution query is
+`WHERE classification IN ('BUG','POSSIBLE_BUG')`).
 Prerequisites before that layer is viable:
 
 1. Sufficient labeled history in `fact_triage_results` (grow the

@@ -156,8 +156,8 @@ building labeled training data with richer rationale. Both write to
 comparable.
 
 **Why `fact_triage_results` matters long-term:** It is the labeled training
-data for a future NN-based PR risk prediction layer. Every BUG
-classification with a `culprit_file` is a labeled outcome. Quality of
+data for a future NN-based PR risk prediction layer. Every BUG and
+POSSIBLE_BUG classification with a `culprit_file` is a labeled outcome. Quality of
 labels now determines quality of the model later.
 
 ## Active backlog (as of April 2026)

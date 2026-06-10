@@ -62,7 +62,13 @@ CREATE TABLE IF NOT EXISTS fact_triage_results (
     -- pre_classification: auto-classified env/infra before reasoning
     --   BUILD_FAILURE, ENV_CHROME, ENV_DEPENDENCY, ENV_DATE, ENV_SETUP, NO_ERROR
     -- classification: reasoning output or AUTO_CLASSIFIED
-    --   BUG, NEEDS_REVIEW, FALSE_POSITIVE, TEST_FIX, AUTO_CLASSIFIED
+    --   BUG, POSSIBLE_BUG, NEEDS_REVIEW, FALSE_POSITIVE, TEST_FIX, AUTO_CLASSIFIED
+    --   BUG = high-confidence verified culprit (the "confirmed" tier).
+    --   POSSIBLE_BUG = exactly one plausible diff-caused culprit at medium
+    --     confidence, not yet verified; culprit_file names the single candidate.
+    --     BUG and POSSIBLE_BUG culprit_files both feed defect-attribution
+    --     training (classification IN ('BUG','POSSIBLE_BUG')).
+    --   NEEDS_REVIEW = 2+ candidate causes, transitive, or low confidence.
     --   TEST_FIX = diff-caused but the production change was intentional;
     --     a stale test lags. culprit_file is null (or the stale test), never
     --     the production file — keeps BUG-culprit defect training data clean.
@@ -225,6 +231,7 @@ CREATE TABLE IF NOT EXISTS triage_run_log (
     classifier   VARCHAR(64) NOT NULL DEFAULT 'batch:v1',
     total_cases  INTEGER,
     bug_count    INTEGER,
+    possible_bug INTEGER,
     needs_review INTEGER,
     false_pos    INTEGER,
     test_fix     INTEGER,
@@ -242,10 +249,13 @@ def ensure_run_log():
     with get_rap_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_RUN_LOG_SQL)
-            # Retrofit test_fix onto pre-existing tables (CREATE TABLE IF NOT
+            # Retrofit columns onto pre-existing tables (CREATE TABLE IF NOT
             # EXISTS won't add new columns to an already-created table).
             cur.execute(
                 "ALTER TABLE triage_run_log ADD COLUMN IF NOT EXISTS test_fix INTEGER;"
+            )
+            cur.execute(
+                "ALTER TABLE triage_run_log ADD COLUMN IF NOT EXISTS possible_bug INTEGER;"
             )
         conn.commit()
 
@@ -271,19 +281,20 @@ def log_run(
             cur.execute("""
                 INSERT INTO triage_run_log (
                     build_id_a, build_id_b, git_hash_a, git_hash_b, classifier,
-                    total_cases, bug_count, needs_review, false_pos, test_fix,
-                    auto_class, flaky_excl, total_tokens_in, total_tokens_out,
-                    duration_seconds, notes
+                    total_cases, bug_count, possible_bug, needs_review, false_pos,
+                    test_fix, auto_class, flaky_excl, total_tokens_in,
+                    total_tokens_out, duration_seconds, notes
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
             """, (
                 build_id_a, build_id_b, git_hash_a, git_hash_b, classifier,
                 len(df),
                 counts.get("BUG", 0),
+                counts.get("POSSIBLE_BUG", 0),
                 counts.get("NEEDS_REVIEW", 0),
                 counts.get("FALSE_POSITIVE", 0),
                 counts.get("TEST_FIX", 0),

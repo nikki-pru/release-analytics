@@ -1,15 +1,15 @@
 # Triage — Claude Code Workflow
 
 Classifies Testray PASSED→FAILED/BLOCKED/UNTESTED regressions as
-BUG / TEST_FIX / NEEDS_REVIEW / FALSE_POSITIVE and writes results to
-`fact_triage_results`.
+BUG / POSSIBLE_BUG / TEST_FIX / NEEDS_REVIEW / FALSE_POSITIVE and writes
+results to `fact_triage_results`.
 
 **TEST_FIX** is for failures the diff *caused* where the production
 change was intentional and correct — only a stale test lags (e.g. a
 renamed label or a selector the diff changed; a Playwright migration
 that left a legacy Poshi test behind). Do **not** put the production
 file in `culprit_file` (that mislabels a correct change as a defect and
-poisons BUG-culprit training data) — leave it null or name the stale
+poisons BUG / POSSIBLE_BUG culprit training data) — leave it null or name the stale
 test, and describe the test change in `specific_change`.
 
 **Two modes, one bundle.** `prepare.py` produces a classifier-agnostic
@@ -124,12 +124,21 @@ For each **non-flaky, non-pre-classified** row in `diff_list.csv`:
    `component_name` or `test_case`. The prompt.md already embeds the
    heuristically-matched hunks per failure — start there.
 3. Evidence evaluation:
-   - Hunk shows a genuine defect that caused the error → **BUG**, name
-     `culprit_file` = the specific path from the diff.
+   - Hunk shows a genuine defect that caused the error, culprit
+     **verified** at high confidence → **BUG**, name `culprit_file` =
+     the specific path from the diff.
+   - Exactly **one** plausible diff-caused culprit at **medium**
+     confidence — concrete enough to name but not verifiable to high
+     → **POSSIBLE_BUG**, name the single candidate in `culprit_file`.
+     The single concrete attribution is what separates this from
+     NEEDS_REVIEW: two or more competing candidates, or no nameable
+     file, is NEEDS_REVIEW — not POSSIBLE_BUG.
    - Hunk shows the production change was **intentional** and the test
      asserts on the old behavior → **TEST_FIX** (culprit_file null or
      the stale test; describe the test change in `specific_change`).
-   - Thematically related but indirect → **NEEDS_REVIEW**.
+   - Two or more competing candidate causes (multi-cause), a transitive
+     theory you can't verify, low confidence, or a generic/aggregate
+     error with no concrete culprit → **NEEDS_REVIEW**.
    - No relevant hunk + classic flake pattern → **FALSE_POSITIVE**.
 4. If a linked Jira ticket is present in `linked_issues`, read the
    summary — it often confirms BUG vs flake.
@@ -176,9 +185,11 @@ Do not guess — escalate when:
 
 ## What not to do
 
-- Do not classify `BUG` without naming a `culprit_file`. `submit.py`
-  will reject the row. Downstream `pr_outcomes` training needs the
-  labels.
+- Do not classify `BUG` or `POSSIBLE_BUG` without naming a
+  `culprit_file`. `submit.py` will reject the row. Downstream
+  `pr_outcomes` training pulls
+  `WHERE classification IN ('BUG','POSSIBLE_BUG')`, so both tiers need
+  the labels.
 - Do not re-classify a case already in `fact_triage_results` for this
   `(build_id_b, classifier)` without explicit user confirmation — the
   upsert will overwrite prior rows.
@@ -323,6 +334,21 @@ Path 2.1 already addresses.
   "missing culprit on one side". Bumped `reason` and `specific_change`
   caps to 4000 chars. Existing path2.1 rows are already truncated;
   re-run if comparison fidelity matters for those.
+- **2026-06-09 (POSSIBLE_BUG tier added):** Split the overloaded
+  NEEDS_REVIEW into POSSIBLE_BUG (single medium-confidence diff-caused
+  culprit, names culprit_file) vs NEEDS_REVIEW (2+ candidates /
+  transitive / low-conf). Kept BUG as the confirmed high-confidence
+  tier (no rename, no data backfill). Both BUG and POSSIBLE_BUG feed
+  defect-attribution training. Motivated by a db×api by-subtask run
+  where a derived five-tier view (Option B) showed 0 single-theory
+  cases recoverable post-hoc from free-text — the single-vs-multi
+  candidate signal must be emitted by the classifier at classification
+  time (Option A), not derived. Touched prepare.py (both RESULTS_SCHEMA
+  enums + both PROMPT_HEADER rubrics), submit.py (_CLASSIFICATIONS +
+  culprit coverage report), store.py (triage_run_log.possible_bug
+  column + ADD COLUMN IF NOT EXISTS retrofit), render_html.py (verdict
+  class/color/order + pill loops), classify_api.py (both
+  system-instruction blocks).
 
 ## End of session summary — use this template
 

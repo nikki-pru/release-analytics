@@ -113,6 +113,13 @@ triage:
   # reads diffs from this working tree.
   git_repo_path: ~/dev/projects/liferay-portal
 
+  # Parent ticket for the "Create Jira ticket" drafts in the rendered
+  # report (render_html.py). Typically a per-cycle umbrella ticket, so it
+  # changes every run — set it here, or override per run with
+  # `submit.py --jira-parent LPD-XXXXX` (or render_html.py --jira-parent).
+  # Leave unset to fall back to the built-in default.
+  jira_parent: LPD-94172
+
   # Errors matching these patterns are auto-classified without sending
   # them to a classifier. Saves cost and focuses the classifier on
   # real candidates.

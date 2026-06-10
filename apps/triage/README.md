@@ -346,7 +346,8 @@ Persisted in `release_analytics`:
 
 | Classification | Meaning |
 |---|---|
-| `BUG`             | Genuine defect caused by a specific change in the diff. MUST name a `culprit_file`. |
+| `BUG`             | Genuine defect caused by a specific change in the diff, culprit verified at high confidence. MUST name a `culprit_file`. |
+| `POSSIBLE_BUG`    | One plausible diff-caused culprit at medium confidence (names the single candidate `culprit_file`); contrast `NEEDS_REVIEW` = 2+ candidates / transitive / low confidence. |
 | `TEST_FIX`        | Diff-caused, but the production change was intentional/correct — a stale test lags (e.g. changed selector/label, Playwright migrated but legacy Poshi not). Update the test, not production. `culprit_file` null (or the stale test), never the production file. |
 | `NEEDS_REVIEW`    | Plausible connection but indirect — needs human judgment. Not a default. |
 | `FALSE_POSITIVE`  | Failure unrelated to diff — env/infra/timing/test isolation. |

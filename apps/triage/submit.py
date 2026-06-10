@@ -42,7 +42,7 @@ from .store import (
 # Validation
 # ---------------------------------------------------------------------------
 
-_CLASSIFICATIONS = {"BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"}
+_CLASSIFICATIONS = {"BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"}
 _CONFIDENCES     = {"high", "medium", "low"}
 
 MODE_PER_TEST   = "per-test"
@@ -389,6 +389,10 @@ def main() -> None:
     ap.add_argument("run_dir", type=Path, help="Path to runs/r_<id>/")
     ap.add_argument("--no-upsert", action="store_true",
                     help="Validate and print summary but skip DB writes.")
+    ap.add_argument("--jira-parent", default=None,
+                    help="Parent ticket key for the prefilled Jira drafts in "
+                         "the rendered report (e.g. LPD-94172). Varies per run; "
+                         "falls back to config triage.jira_parent / default.")
     args = ap.parse_args()
 
     run_dir: Path = args.run_dir.resolve()
@@ -467,6 +471,13 @@ def main() -> None:
         if "culprit_file=" in str(r.get("reason") or "")
     )
     culprit_pct = (100 * culprit_hits / len(bug_rows)) if len(bug_rows) else 0.0
+    # POSSIBLE_BUG also carries a candidate culprit and feeds defect training
+    # (classification IN ('BUG','POSSIBLE_BUG')) — report its coverage too.
+    pbug_rows = df[df["classification"] == "POSSIBLE_BUG"]
+    pbug_hits = sum(
+        1 for _, r in pbug_rows.iterrows()
+        if "culprit_file=" in str(r.get("reason") or "")
+    )
 
     print(f"\nRun:        {meta['run_id']}")
     print(f"Classifier: {payload['classifier']}")
@@ -477,6 +488,9 @@ def main() -> None:
           + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     print(f"BUG culprit_file coverage: {culprit_hits}/{len(bug_rows)} "
           f"({culprit_pct:.0f}%; target ≥85%)")
+    if len(pbug_rows):
+        print(f"POSSIBLE_BUG candidate-culprit coverage: {pbug_hits}/{len(pbug_rows)} "
+              f"({100 * pbug_hits / len(pbug_rows):.0f}%) — feeds training with BUG")
     if mode == MODE_BY_SUBTASK:
         n_subtasks = len(payload["results"])
         n_with_sid = int(df["subtask_id"].notna().sum())
@@ -484,7 +498,7 @@ def main() -> None:
               f"{n_with_sid} case-rows carry subtask_id "
               f"(remaining {len(df) - n_with_sid} are unmapped/auto/missing)")
 
-    report_path = render_run(run_dir)
+    report_path = render_run(run_dir, jira_parent=args.jira_parent)
     print(f"Report:     {report_path}")
 
     if args.no_upsert:

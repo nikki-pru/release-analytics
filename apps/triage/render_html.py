@@ -29,12 +29,42 @@ import yaml
 from .prepare import (
     _testray_fetch_paginated,
     _testray_oauth_token,
+    fetch_commits_for_file,
     fetch_commits_in_range,
     load_config,
 )
 
 
 _TICKET_RE = re.compile(r'\b((?:LPD|LPP|LPS)-\d+)\b')
+
+
+def _commits_for_file(culprit_file: str | None,
+                      repo_path: str | None,
+                      hash_a: str | None,
+                      hash_b: str | None,
+                      cache: dict[str, str]) -> str:
+    """Fallback commit attribution: when a verdict names a culprit_file but
+    cited no ticket, list the commits in A..B that actually touched that file.
+    e.g. 'Foo.java ← 70fdac5 LPD-123 Add wrapper; abc1234 …'. Cached per path;
+    empty string when nothing applies (attribution is purely additive)."""
+    if not (culprit_file and repo_path and hash_a and hash_b):
+        return ""
+    if culprit_file in cache:
+        return cache[culprit_file]
+    try:
+        commits = fetch_commits_for_file(
+            Path(repo_path).expanduser(), hash_a, hash_b, culprit_file)
+    except Exception:
+        commits = []
+    if not commits:
+        cache[culprit_file] = ""
+        return ""
+    base = culprit_file.rsplit("/", 1)[-1]
+    parts = [f"{sha} {(subj or '')[:60]}".rstrip() for sha, subj in commits[:3]]
+    tail = f" +{len(commits) - 3} more" if len(commits) > 3 else ""
+    out = f"{base} ← " + "; ".join(parts) + tail
+    cache[culprit_file] = out
+    return out
 
 
 def _build_ticket_commit_map(
@@ -88,6 +118,7 @@ def _commits_for_text(text: str,
 
 _VERDICT_CLASS = {
     "BUG":             "bug",
+    "POSSIBLE_BUG":    "pbug",
     "NEEDS_REVIEW":    "needs",
     "TEST_FIX":        "testfix",
     "FALSE_POSITIVE":  "fp",
@@ -97,6 +128,7 @@ _VERDICT_CLASS = {
 _CSS = """
   :root {
     --c-bug: #c0392b;
+    --c-pbug: #e67e22;
     --c-needs: #d68910;
     --c-testfix: #2471a3;
     --c-fp: #5d6d7e;
@@ -176,6 +208,7 @@ _CSS = """
     white-space: nowrap;
   }
   .verdict.bug { background: var(--c-bug); }
+  .verdict.pbug { background: var(--c-pbug); }
   .verdict.needs { background: var(--c-needs); }
   .verdict.testfix { background: var(--c-testfix); }
   .verdict.fp { background: var(--c-fp); }
@@ -215,6 +248,7 @@ _CSS = """
     border-radius: 4px;
   }
   section.detail.bug { border-left-color: var(--c-bug); }
+  section.detail.pbug { border-left-color: var(--c-pbug); }
   section.detail.needs { border-left-color: var(--c-needs); }
   section.detail.testfix { border-left-color: var(--c-testfix); }
   section.detail.fp { border-left-color: var(--c-fp); }
@@ -557,7 +591,7 @@ def _fingerprint(r: dict) -> str:
     return f"{r['verdict']}|{culprit}|{err}|{reason}"
 
 
-_VERDICT_ORDER = {"BUG": 0, "NEEDS_REVIEW": 1, "TEST_FIX": 2, "FALSE_POSITIVE": 3, "AUTO_CLASSIFIED": 4}
+_VERDICT_ORDER = {"BUG": 0, "POSSIBLE_BUG": 1, "NEEDS_REVIEW": 2, "TEST_FIX": 3, "FALSE_POSITIVE": 4, "AUTO_CLASSIFIED": 5}
 
 
 def _render_details(rows: list[dict]) -> str:
@@ -618,7 +652,7 @@ def _render(meta: dict, payload: dict, rows: list[dict]) -> str:
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(
@@ -702,7 +736,11 @@ def _load_cluster_annotations(run_dir: Path) -> dict[int, dict[str, str]]:
 def _build_subtask_rows(diff_subtasks: pd.DataFrame,
                         diff_list: pd.DataFrame,
                         results: list[dict],
-                        cluster_annotations: dict[int, dict[str, str]]) -> list[dict]:
+                        cluster_annotations: dict[int, dict[str, str]],
+                        ticket_map: dict[str, list[tuple[str, str]]] | None = None,
+                        repo_path: str | None = None,
+                        hash_a: str | None = None,
+                        hash_b: str | None = None) -> list[dict]:
     """One render row per subtask. Joins per-subtask metadata with
     the LLM verdict in results.json and the optional cluster_report.csv
     annotation. Flaky-only subtasks are dropped to mirror per-test
@@ -715,6 +753,7 @@ def _build_subtask_rows(diff_subtasks: pd.DataFrame,
         teams_by_sid[int(sid)] = teams
 
     rows: list[dict] = []
+    file_cache: dict[str, str] = {}
     for _, row in diff_subtasks.iterrows():
         if row.get("bucket") == "flaky-only":
             continue
@@ -723,6 +762,8 @@ def _build_subtask_rows(diff_subtasks: pd.DataFrame,
         member_ids = [m for m in str(row.get("member_case_ids") or "").split("|") if m]
         teams = teams_by_sid.get(sid, [])
 
+        specific_change = ""
+        culprit_file = ""
         if row.get("bucket") == "auto-only":
             verdict, conf = "AUTO_CLASSIFIED", "auto"
             reason = f"pre_classification={row.get('pre_classifications') or '—'}"
@@ -732,11 +773,24 @@ def _build_subtask_rows(diff_subtasks: pd.DataFrame,
                 verdict = r["classification"]
                 conf = r.get("confidence") or ""
                 reason = r.get("reason") or ""
+                specific_change = r.get("specific_change") or ""
+                culprit_file = r.get("culprit_file") or ""
             else:
                 verdict, conf = "NEEDS_REVIEW", "low"
                 reason = "No entry in results.json — defaulted to NEEDS_REVIEW"
 
         ann = cluster_annotations.get(sid, {})
+        # Suspicious commits: attribute the cited tickets to commits in the
+        # diff range (mirrors the per-test renderer). Falls back to the
+        # cluster_report 'root cause from diff' annotation when present, then
+        # to commits that touched the named culprit_file (BUG/POSSIBLE_BUG
+        # verdicts that name a file but cite no ticket).
+        commit_anno = _commits_for_text(
+            f"{reason} {specific_change}", ticket_map or {})
+        suspicious_commits = ann.get("root_cause_from_diff", "") or commit_anno
+        if not suspicious_commits and culprit_file:
+            suspicious_commits = _commits_for_file(
+                culprit_file, repo_path, hash_a, hash_b, file_cache)
         rows.append({
             "subtask_id":          sid,
             "case_count":          int(row.get("case_count") or len(member_ids)),
@@ -749,8 +803,9 @@ def _build_subtask_rows(diff_subtasks: pd.DataFrame,
             "verdict":             verdict,
             "confidence":          conf,
             "reason":              reason,
-            "root_cause":          ann.get("cluster", ""),
-            "root_cause_from_diff": ann.get("root_cause_from_diff", ""),
+            "specific_change":     specific_change,
+            "culprit_file":        culprit_file,
+            "suspicious_commits":  suspicious_commits,
         })
     return rows
 
@@ -779,6 +834,91 @@ _TESTRAY_BUILD_URL = (
 # verdict + suspicious commits + reasoning via Jira's `?summary=…&description=…`
 # query params (or via the REST API for a full templated body).
 _JIRA_CREATE_URL = "https://liferay.atlassian.net/secure/CreateIssue!default.jspa"
+_JIRA_BASE = "https://liferay.atlassian.net"
+# Jira Cloud honors the legacy CreateIssueDetails!init.jspa endpoint for
+# URL-templated tickets (static-HTML friendly — it's just query params).
+# Resolved via the Jira API (2026-06-10): LPD project id + issue-type ids.
+_JIRA_PID = "11106"
+_JIRA_TASK_TYPE_ID = "10002"
+_JIRA_BUG_TYPE_ID = "10004"
+# Default parent ticket for prefilled drafts. Overridable per run via
+# --jira-parent (CLI), run.yml `jira_parent`, or triage.jira_parent in
+# config.yml — see render_run().
+_JIRA_PARENT_KEY = "LPD-94172"
+_JIRA_LABEL = "release-test-failure"     # label stamped on every triage draft
+
+
+def _jira_myself_account_id(cfg: dict | None) -> str:
+    """Resolve the triage operator's Jira accountId via /rest/api/3/myself
+    (the account whose creds are in config.yml). Used to set Reporter on the
+    prefilled draft — the legacy CreateIssueDetails endpoint requires Reporter
+    and won't auto-fill it. Empty string on any failure (the field is then
+    left for the user to set)."""
+    j = (cfg or {}).get("jira") or {}
+    base = (j.get("base_url") or "").rstrip("/")
+    email, token = j.get("email"), j.get("api_token")
+    if not (base and email and token):
+        return ""
+    import base64 as _b64, urllib.request
+    try:
+        auth = _b64.b64encode(f"{email}:{token}".encode()).decode()
+        req = urllib.request.Request(
+            f"{base}/rest/api/3/myself",
+            headers={"Authorization": f"Basic {auth}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read()).get("accountId", "") or ""
+    except Exception:
+        return ""
+
+
+def _jira_prefill_url(summary: str, description: str, issuetype: str,
+                      extra: dict[str, str] | None = None) -> str:
+    """Build a Jira Cloud Create-Issue URL pre-filled with summary +
+    description (and any extra field params). The draft opens in Jira for the
+    user to review and submit — nothing is created automatically."""
+    from urllib.parse import quote
+    parts = [f"pid={_JIRA_PID}", f"issuetype={issuetype}",
+             f"summary={quote(summary[:240])}",
+             f"description={quote(description[:4000])}"]
+    for k, v in (extra or {}).items():
+        parts.append(f"{k}={quote(str(v))}")
+    return f"{_JIRA_BASE}/secure/CreateIssueDetails!init.jspa?" + "&".join(parts)
+
+
+def _subtask_jira_url(r: dict, meta: dict) -> str:
+    """Pre-filled LPD Task draft for one subtask, per the triage ticket
+    template: Task type, 'Investigate test failure in …' summary, parent
+    LPD-94172, and a wiki-markup body with the Testray link, the shared error
+    in a {code} block, and Claude's reasoning."""
+    sid = r["subtask_id"]
+    members = r.get("member_test_cases") or []
+    if members:
+        test_label = members[0][:120]
+        if len(members) > 1:
+            test_label += f" (+{len(members) - 1} more)"
+    else:
+        test_label = r.get("components") or f"subtask {sid}"
+    summary = f"Investigate test failure in {test_label}"
+
+    flow = meta.get("testflow_id")
+    testray = _TESTRAY_SUBTASK_URL.format(flow=flow, sid=sid) if flow else ""
+    link = f"[Testray Subtask|{testray}]" if testray else "Testray Subtask (no testflow id)"
+    err = (r.get("shared_error") or "").strip()[:800] or "—"
+    desc = (
+        f"{link}\n\n"
+        f"Error message:\n"
+        f"{{code}}{err}{{code}}\n\n"
+        f"Claude reasoning:\n"
+        f"{r.get('reason') or '—'}"
+    )
+    extra = {"labels": _JIRA_LABEL}
+    parent = meta.get("jira_parent")
+    if parent:
+        extra["parent"] = parent
+    reporter = meta.get("jira_reporter_account_id")
+    if reporter:
+        extra["reporter"] = reporter
+    return _jira_prefill_url(summary, desc, _JIRA_TASK_TYPE_ID, extra=extra)
 
 
 def _fetch_build_name(build_id: int, cfg: dict) -> str | None:
@@ -862,7 +1002,10 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
                          results: list[dict],
                          api_meta: dict[str, dict],
                          cluster_map: dict[str, dict[str, str]],
-                         ticket_map: dict[str, list[tuple[str, str]]] | None = None) -> list[dict]:
+                         ticket_map: dict[str, list[tuple[str, str]]] | None = None,
+                         repo_path: str | None = None,
+                         hash_a: str | None = None,
+                         hash_b: str | None = None) -> list[dict]:
     """One render row per test case in diff_list.csv.
 
     Verdicts come from results.json. If results are keyed on subtask_id (the
@@ -887,6 +1030,7 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
             by_cid[cid] = r
 
     rows: list[dict] = []
+    file_cache: dict[str, str] = {}
     for _, row in diff_list.iterrows():
         if bool(row.get("known_flaky")):
             continue
@@ -897,6 +1041,7 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
 
         pre = row.get("pre_classification")
         specific_change = ""
+        culprit_file = ""
         if pd.notna(pre) and pre:
             verdict, conf = "AUTO_CLASSIFIED", "auto"
             reason = f"pre_classification={pre}"
@@ -907,6 +1052,7 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
                 conf = r.get("confidence") or ""
                 reason = r.get("reason") or ""
                 specific_change = r.get("specific_change") or ""
+                culprit_file = r.get("culprit_file") or ""
             else:
                 verdict, conf = "NEEDS_REVIEW", "low"
                 reason = "No entry in results.json — defaulted to NEEDS_REVIEW"
@@ -920,8 +1066,13 @@ def _build_per_test_rows(diff_list: pd.DataFrame,
         # Suspicious commits column = commit annotation only; reasoning lives
         # in its own column. If a manual cluster_report.csv supplied an
         # 'rootCause from diff' value, treat it as the canonical commit
-        # annotation (manual labels win over auto-derived ones).
+        # annotation (manual labels win over auto-derived ones). Final
+        # fallback: commits that touched the named culprit_file when the
+        # verdict cited a file but no ticket.
         suspicious_commits = ann.get("root_cause_from_diff", "") or commit_anno
+        if not suspicious_commits and culprit_file:
+            suspicious_commits = _commits_for_file(
+                culprit_file, repo_path, hash_a, hash_b, file_cache)
         reasoning = reason
 
         rows.append({
@@ -1385,7 +1536,7 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict],
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(
@@ -1536,6 +1687,7 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict],
     margin-left: 40px;  /* align under the col-idx caret */
   }}
   table.per-test-table tr.case-detail.bug   .case-detail-inner {{ border-left-color: var(--c-bug); }}
+  table.per-test-table tr.case-detail.pbug  .case-detail-inner {{ border-left-color: var(--c-pbug); }}
   table.per-test-table tr.case-detail.needs .case-detail-inner {{ border-left-color: var(--c-needs); }}
   table.per-test-table tr.case-detail.fp    .case-detail-inner {{ border-left-color: var(--c-fp); }}
   table.per-test-table tr.case-detail.auto  .case-detail-inner {{ border-left-color: var(--c-auto); }}
@@ -1588,14 +1740,17 @@ def _render_per_test(meta: dict, payload: dict, rows: list[dict],
 """
 
 
-def _render_subtask_table(rows: list[dict], testflow_id: str | int | None) -> str:
+def _render_subtask_table(rows: list[dict], testflow_id: str | int | None,
+                          meta: dict | None = None) -> str:
+    meta = meta or {}
     cols = [('#', 'col-idx'), ('Subtask', 'col-sid')]
     if testflow_id:
         cols.append(('Testray', 'col-link'))
     cols += [('Tests', 'col-n'), ('Component', 'col-comp'),
              ('Team', 'col-team'), ('Status', 'col-status'),
-             ('Verdict', 'col-verdict'),
-             ('Root cause', 'col-rc'), ('Root cause from diff', 'col-rcd')]
+             ('Verdict', 'col-verdict'), ('Confidence', 'col-confidence'),
+             ('Suspicious commits', 'col-suspicious'), ('Reasoning', 'col-reasoning'),
+             ('Create Jira ticket', 'col-jira')]
     out = ['<table class="subtask-table">', '<thead><tr>']
     out += [f'<th class="{c}">{h}</th>' for h, c in cols]
     out += ['</tr></thead>', '<tbody>']
@@ -1603,14 +1758,21 @@ def _render_subtask_table(rows: list[dict], testflow_id: str | int | None) -> st
         vclass = _VERDICT_CLASS[r["verdict"]]
         team = ", ".join(r["teams"]) if r["teams"] else "—"
         comp = _esc(r["components"]) or "—"
-        rc = _esc(r["root_cause"]) or "—"
-        rcd = _esc(r["root_cause_from_diff"]) or "—"
+        suspicious = _esc(r["suspicious_commits"]) or "—"
+        reasoning = _esc(r["reason"]) or "—"
+        conf_class = r["confidence"] if r["confidence"] in ("high", "medium", "low") else ""
+        conf_cell = (f'<span class="conf {conf_class}">{_esc(r["confidence"])}</span>'
+                     if r["confidence"] else "—")
         link_cell = ""
         if testflow_id:
             url = _TESTRAY_SUBTASK_URL.format(flow=testflow_id, sid=r["subtask_id"])
             link_cell = f'<td class="col-link"><a href="{url}" target="_blank" rel="noopener">open</a></td>'
+        search_blob = _esc(" ".join(str(x) for x in (
+            r["subtask_id"], r["components"], team, r["status_b_breakdown"],
+            r["suspicious_commits"], r["reason"], r["verdict"])).lower())
         out.append(
-            f'<tr id="subtask-{r["subtask_id"]}">'
+            f'<tr id="subtask-{r["subtask_id"]}" data-verdict="{_esc(r["verdict"])}" '
+            f'data-team="{_esc(team)}" data-text="{search_blob}">'
             f'<td class="col-idx col-num">{i}</td>'
             f'<td class="col-sid"><code>{r["subtask_id"]}</code></td>'
             f'{link_cell}'
@@ -1619,8 +1781,16 @@ def _render_subtask_table(rows: list[dict], testflow_id: str | int | None) -> st
             f'<td class="col-team">{_esc(team)}</td>'
             f'<td class="col-status"><code class="status">{_esc(r["status_b_breakdown"])}</code></td>'
             f'<td class="col-verdict"><span class="verdict {vclass}">{_esc(r["verdict"])}</span></td>'
-            f'<td class="col-rc">{rc}</td>'
-            f'<td class="col-rcd">{rcd}</td>'
+            f'<td class="col-confidence">{conf_cell}</td>'
+            f'<td class="col-suspicious">{suspicious}</td>'
+            f'<td class="col-reasoning">{reasoning}</td>'
+            f'<td class="col-jira">'
+            f'<a class="jira-create" href="{_esc(_subtask_jira_url(r, meta))}" '
+            f'target="_blank" rel="noopener" '
+            f'title="Opens Jira Create with a prefilled LPD Task draft for this '
+            f'subtask (parent LPD-94172, Testray link, error, Claude '
+            f'reasoning). Review before submitting — nothing is created automatically.">'
+            f'Create</a></td>'
             f'</tr>'
         )
     out.append('</tbody></table>')
@@ -1658,8 +1828,8 @@ def _render_subtask_details(rows: list[dict], testflow_id: str | int | None) -> 
             ("Status",        f'<code>{_esc(r["status_b_breakdown"])}</code>'),
             ("Linked Jira",   _esc(r["linked_issues"])),
             ("Shared error",  _err_html(r["shared_error"])),
-            ("Root cause",    _esc(r["root_cause"])),
-            ("Root cause from diff", _esc(r["root_cause_from_diff"])),
+            ("Specific change", _esc(r["specific_change"])),
+            ("Suspicious commits", _esc(r["suspicious_commits"])),
             ("Reasoning",     _esc(r["reason"])),
             ("Member tests",  member_html),
         ]
@@ -1670,6 +1840,48 @@ def _render_subtask_details(rows: list[dict], testflow_id: str | int | None) -> 
             f'</section>'
         )
     return "\n".join(out)
+
+
+_SUBTASK_FILTER_JS = """
+(function () {
+  var table = document.querySelector('table.subtask-table');
+  if (!table) return;
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr'));
+  var vSel = document.getElementById('verdict-filter');
+  var tSel = document.getElementById('team-filter');
+  var search = document.getElementById('search-filter');
+  var countEl = document.getElementById('filter-count');
+  var verdicts = {}, teams = {};
+  rows.forEach(function (r) {
+    var v = r.getAttribute('data-verdict'); if (v) verdicts[v] = 1;
+    var t = r.getAttribute('data-team');
+    if (t) t.split(',').forEach(function (x) { x = x.trim(); if (x && x !== '\\u2014') teams[x] = 1; });
+  });
+  Object.keys(verdicts).sort().forEach(function (v) {
+    var o = document.createElement('option'); o.value = v; o.textContent = v; vSel.appendChild(o);
+  });
+  Object.keys(teams).sort().forEach(function (t) {
+    var o = document.createElement('option'); o.value = t; o.textContent = t; tSel.appendChild(o);
+  });
+  function apply() {
+    var v = vSel.value, t = tSel.value.toLowerCase(), s = search.value.toLowerCase().trim(), shown = 0;
+    rows.forEach(function (r) {
+      var okV = !v || r.getAttribute('data-verdict') === v;
+      var okT = !t || (r.getAttribute('data-team') || '').toLowerCase().indexOf(t) !== -1;
+      var okS = !s || (r.getAttribute('data-text') || '').indexOf(s) !== -1;
+      var show = okV && okT && okS;
+      r.style.display = show ? '' : 'none';
+      if (show) shown++;
+    });
+    if (countEl) countEl.textContent = shown + ' / ' + rows.length + ' subtasks';
+  }
+  vSel.addEventListener('change', apply);
+  tSel.addEventListener('change', apply);
+  search.addEventListener('input', apply);
+  search.addEventListener('keydown', function (e) { if (e.key === 'Escape') { search.value = ''; apply(); } });
+  apply();
+})();
+"""
 
 
 def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
@@ -1692,7 +1904,7 @@ def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
     ]
 
     pills: list[str] = []
-    for v in ("BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
+    for v in ("BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX", "FALSE_POSITIVE", "AUTO_CLASSIFIED"):
         n = counts.get(v, 0)
         cls = _VERDICT_CLASS[v]
         pills.append(
@@ -1729,13 +1941,52 @@ def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
   table.subtask-table th.col-team {{ width: 110px; }}
   table.subtask-table th.col-status {{ width: 130px; }}
   table.subtask-table th.col-verdict {{ width: 130px; }}
-  /* Root-cause columns get the remaining space, weighted toward the
-     longer 'from diff' column. */
-  table.subtask-table th.col-rc, table.subtask-table td.col-rc {{ min-width: 240px; }}
-  table.subtask-table th.col-rcd, table.subtask-table td.col-rcd {{ min-width: 360px; }}
-  table.subtask-table td.col-rc, table.subtask-table td.col-rcd {{
+  table.subtask-table th.col-confidence,
+  table.subtask-table td.col-confidence {{ width: 90px; text-align: center; }}
+  /* Suspicious-commits + reasoning get the remaining space, weighted
+     toward the longer reasoning column. */
+  table.subtask-table th.col-suspicious, table.subtask-table td.col-suspicious {{ min-width: 240px; }}
+  table.subtask-table th.col-reasoning, table.subtask-table td.col-reasoning {{ min-width: 360px; }}
+  table.subtask-table td.col-suspicious, table.subtask-table td.col-reasoning {{
     white-space: normal; line-height: 1.45;
   }}
+  /* Filter bar — mirror the per-test report's styling. */
+  .filters {{
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 18px 0 14px;
+    padding: 10px 14px;
+    background: var(--c-row);
+    border: 1px solid var(--c-border);
+    border-radius: 4px;
+    font-size: 13px;
+  }}
+  .filters-row {{
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }}
+  .filters label {{ font-weight: 600; }}
+  .filters select, .filters input[type="search"] {{
+    font: inherit; padding: 4px 6px;
+    border: 1px solid var(--c-border);
+    border-radius: 3px; background: white;
+    min-width: 240px;
+  }}
+  .filters input[type="search"] {{ min-width: 360px; flex: 1 1 auto; }}
+  .filters .visible-count {{ color: var(--c-muted); margin-left: auto; }}
+  /* Create-Jira column + button — mirror the per-test report. */
+  table.subtask-table th.col-jira, table.subtask-table td.col-jira {{
+    width: 90px; text-align: center;
+  }}
+  a.jira-create {{
+    display: inline-block;
+    padding: 4px 10px;
+    background: #0052cc;
+    color: #fff;
+    border-radius: 3px;
+    font-size: 12px;
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  a.jira-create:hover {{ background: #0747a6; }}
 </style>
 </head>
 <body>
@@ -1745,13 +1996,28 @@ def _render_subtask(meta: dict, payload: dict, rows: list[dict]) -> str:
   <div class="totals">{''.join(pills)}</div>
   {_RATIONALE_HTML if counts.get("BUG", 0) == 0 else ""}
 
+  <div class="filters">
+    <div class="filters-row">
+      <label for="verdict-filter">Verdict:</label>
+      <select id="verdict-filter"><option value="">All verdicts</option></select>
+      <label for="team-filter">Team:</label>
+      <select id="team-filter"><option value="">All teams</option></select>
+    </div>
+    <div class="filters-row">
+      <label for="search-filter">Search:</label>
+      <input id="search-filter" type="search" placeholder="filter by subtask, component, team, status, root cause… (Esc to clear)" autocomplete="off">
+      <span class="visible-count" id="filter-count"></span>
+    </div>
+  </div>
+
   <h2>All subtasks</h2>
-  {_render_subtask_table(rows, meta.get('testflow_id'))}
+  {_render_subtask_table(rows, meta.get('testflow_id'), meta)}
 
   <h2>Details</h2>
   {_render_subtask_details(rows, meta.get('testflow_id'))}
 </main>
 <script>{_SORT_JS}</script>
+<script>{_SUBTASK_FILTER_JS}</script>
 </body>
 </html>
 """
@@ -1761,10 +2027,21 @@ def render_run(run_dir: Path,
                testflow_id: str | int | None = None,
                per_test: bool = False,
                compare_build_id: int | None = None,
-               compare_label: str = "master") -> Path:
+               compare_label: str = "master",
+               jira_parent: str | None = None) -> Path:
     meta = yaml.safe_load((run_dir / "run.yml").read_text())
     if testflow_id is not None:
         meta["testflow_id"] = testflow_id
+    # Parent ticket for the prefilled Jira drafts varies per run. Resolution
+    # order: explicit arg > run.yml jira_parent > triage.jira_parent in
+    # config.yml > the _JIRA_PARENT_KEY default. Empty disables the parent
+    # field entirely.
+    meta["jira_parent"] = (
+        jira_parent
+        or meta.get("jira_parent")
+        or (load_config().get("triage", {}) or {}).get("jira_parent")
+        or _JIRA_PARENT_KEY
+    )
     payload = json.loads((run_dir / "results.json").read_text())
     diff_list = pd.read_csv(run_dir / "diff_list.csv")
     out = run_dir / "report.html"
@@ -1780,6 +2057,9 @@ def render_run(run_dir: Path,
         )
         rows = _build_per_test_rows(
             diff_list, payload["results"], api_meta, cluster_map, ticket_map,
+            repo_path=cfg.get("git", {}).get("repo_path"),
+            hash_a=meta.get("git_hash_a"),
+            hash_b=meta.get("git_hash_b"),
         )
         compare_meta = None
         if compare_build_id is not None:
@@ -1799,8 +2079,18 @@ def render_run(run_dir: Path,
     elif meta.get("mode") == "by-subtask":
         diff_subtasks = pd.read_csv(run_dir / "diff_list_subtasks.csv")
         cluster_ann = _load_cluster_annotations(run_dir)
+        cfg = load_config()
+        meta["jira_reporter_account_id"] = _jira_myself_account_id(cfg)
+        ticket_map = _build_ticket_commit_map(
+            cfg.get("git", {}).get("repo_path"),
+            meta.get("git_hash_a"),
+            meta.get("git_hash_b"),
+        )
         rows = _build_subtask_rows(diff_subtasks, diff_list,
-                                   payload["results"], cluster_ann)
+                                   payload["results"], cluster_ann, ticket_map,
+                                   repo_path=cfg.get("git", {}).get("repo_path"),
+                                   hash_a=meta.get("git_hash_a"),
+                                   hash_b=meta.get("git_hash_b"))
         out.write_text(_render_subtask(meta, payload, rows))
     else:
         rows = _build_rows(diff_list, payload["results"])
@@ -1830,12 +2120,18 @@ def main() -> None:
     ap.add_argument("--compare-label", default="master",
                     help="Display label for the --compare-build column "
                          "(default: 'master').")
+    ap.add_argument("--jira-parent", default=None,
+                    help="Parent ticket key for the prefilled Jira drafts "
+                         "(e.g. LPD-94172). Varies per run. Overrides "
+                         "run.yml::jira_parent and triage.jira_parent in "
+                         "config.yml; falls back to the built-in default.")
     args = ap.parse_args()
     out = render_run(args.run_dir.resolve(),
                      testflow_id=args.testflow_id,
                      per_test=args.per_test,
                      compare_build_id=args.compare_build,
-                     compare_label=args.compare_label)
+                     compare_label=args.compare_label,
+                     jira_parent=args.jira_parent)
     print(f"Wrote {out}")
 
 
